@@ -142,6 +142,14 @@ class _Inflight:
 
 
 @dataclass(frozen=True)
+class RawBlockDeleteResult:
+    """Per-key result returned by :meth:`RawBlockCore.delete_many`."""
+
+    deleted: bool
+    was_indexed: bool
+
+
+@dataclass(frozen=True)
 class RawBlockPutManyResult:
     """Result of a RawBlockCore batched write."""
 
@@ -655,7 +663,7 @@ class RawBlockCore:
         encoded_keys: Sequence[str],
         *,
         force: bool = False,
-    ) -> list[bool]:
+    ) -> list[RawBlockDeleteResult]:
         """Delete indexed keys and recycle their slots when allowed.
 
         Args:
@@ -664,16 +672,22 @@ class RawBlockCore:
                 false so locked entries are preserved.
 
         Returns:
-            A list of per-key deletion booleans aligned with ``encoded_keys``.
+            A list of per-key :class:`RawBlockDeleteResult` aligned with
+            ``encoded_keys``. ``deleted`` is True when the key was removed.
+            ``was_indexed`` is True when the key was in the index (not merely
+            inflight) at the moment of deletion; callers use this to charge
+            the correct byte size to usage accounting.
         """
-        deleted: list[bool] = []
+        results: list[RawBlockDeleteResult] = []
         with self._lock:
             for encoded_key in encoded_keys:
                 existed = encoded_key in self._index or encoded_key in self._inflight
                 entry = self._index.get(encoded_key)
                 locked = self._lock_refcnt.get(encoded_key, 0) > 0
                 if entry is not None and locked and not force:
-                    deleted.append(False)
+                    results.append(
+                        RawBlockDeleteResult(deleted=False, was_indexed=False)
+                    )
                     continue
 
                 removed_entry = self._index.pop(encoded_key, None)
@@ -686,10 +700,16 @@ class RawBlockCore:
                         self._offset_to_slot(int(removed_entry.offset))
                     )
                     self._meta_dirty_total += 1
-                deleted.append(
-                    existed and (removed_entry is not None or inflight is not None)
+                deleted = existed and (
+                    removed_entry is not None or inflight is not None
                 )
-        return deleted
+                results.append(
+                    RawBlockDeleteResult(
+                        deleted=deleted,
+                        was_indexed=removed_entry is not None,
+                    )
+                )
+        return results
 
     def usage(self) -> tuple[float, float]:
         """Return current raw-block slot usage fractions.
