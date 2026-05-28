@@ -351,60 +351,110 @@ class RustRawBlockBackend(StoragePluginInterface):
         transfer_spec: Any = None,  # noqa: ARG002
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> list[Future] | None:
+        """Submit a batch of memory objects to be persisted asynchronously.
+
+        Keys that are already indexed, already inflight in the core, or already
+        tracked in this backend's put-task set are filtered out before
+        submission. The surviving keys are persisted via a single
+        ``RawBlockCore.put_many`` call dispatched on the asyncio loop.
+
+        Args:
+            keys: Ordered legacy cache keys to persist.
+            objs: Memory objects aligned with ``keys``.
+            transfer_spec: Unused; accepted for interface compatibility.
+            on_complete_callback: Optional callback invoked once per key whose
+                ``put_many`` result is True. Callback exceptions are caught and
+                logged.
+
+        Returns:
+            A list of length equal to the number of accepted keys, where every
+            entry is the same ``Future`` representing the batched submission.
+            ``None`` when no key survived dedup filtering. The future completes
+            successfully when at least one key was persisted; it carries a
+            ``RuntimeError`` when every accepted key failed to persist. Per-key
+            failures within a partially successful batch are logged but do not
+            mark the future as failed.
+
+        Raises:
+            RuntimeError: If the backend has no asyncio loop attached.
+        """
         del transfer_spec
-        futures: list[Future] = []
-        for key, obj in zip(keys, objs, strict=False):
-            with self._put_lock:
+        if not keys:
+            return None
+        loop = self.loop
+        if loop is None:
+            raise RuntimeError("RustRawBlockBackend requires an asyncio event loop")
+
+        specs = [encode_legacy_key(key) for key in keys]
+        encoded_keys = [spec.encoded for spec in specs]
+        indexed_bitmap = self._core.exists_many(encoded_keys, lock=False)
+
+        accepted_keys: list[CacheEngineKey] = []
+        accepted_specs: list[RawBlockKeySpec] = []
+        accepted_objs: list[MemoryObj] = []
+        with self._put_lock:
+            for i, key in enumerate(keys):
                 if key in self._put_tasks:
                     continue
+                if indexed_bitmap[i]:
+                    continue
+                if self._core.exists_inflight(encoded_keys[i]):
+                    continue
                 self._put_tasks.add(key)
+                accepted_keys.append(key)
+                accepted_specs.append(specs[i])
+                accepted_objs.append(objs[i])
 
-            spec = encode_legacy_key(key)
-            exists = self._core.contains_key(
-                spec.encoded,
-                lock=False,
-            ) or self._core.exists_inflight(spec.encoded)
-            if exists:
-                with self._put_lock:
-                    self._put_tasks.discard(key)
-                continue
+        if not accepted_keys:
+            return None
 
+        for obj in accepted_objs:
             obj.ref_count_up()
-            loop = self.loop
-            if loop is None:
-                obj.ref_count_down()
-                raise RuntimeError("RustRawBlockBackend requires an asyncio event loop")
-            fut = asyncio.run_coroutine_threadsafe(
-                self._submit_put_one(key, spec, obj, on_complete_callback),
-                loop,
-            )
-            futures.append(fut)
-        return futures or None
 
-    async def _submit_put_one(
+        fut = asyncio.run_coroutine_threadsafe(
+            self._submit_put_batch(
+                accepted_keys, accepted_specs, accepted_objs, on_complete_callback
+            ),
+            loop,
+        )
+        return [fut] * len(accepted_keys)
+
+    async def _submit_put_batch(
         self,
-        key: CacheEngineKey,
-        spec: RawBlockKeySpec,
-        memory_obj: MemoryObj,
+        keys: list[CacheEngineKey],
+        specs: list[RawBlockKeySpec],
+        memory_objs: list[MemoryObj],
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
     ) -> None:
         try:
             put_result = await asyncio.to_thread(
                 self._core.put_many,
-                [spec],
-                [memory_obj],
+                specs,
+                memory_objs,
             )
-            if not put_result.results or not put_result.results[0]:
-                raise RuntimeError(f"Failed to persist raw-block key {spec.encoded}")
-            if on_complete_callback is not None:
-                try:
-                    on_complete_callback(key)
-                except Exception as e:
-                    logger.warning("on_complete_callback failed for key %s: %s", key, e)
+            results = put_result.results
+            if not results or not any(results):
+                raise RuntimeError(
+                    f"Failed to persist raw-block batch of {len(keys)} keys "
+                    f"(first encoded: {specs[0].encoded})"
+                )
+            for key, ok in zip(keys, results, strict=True):
+                if not ok:
+                    logger.warning("RustRawBlockBackend: put failed for key %s", key)
+                    continue
+                if on_complete_callback is not None:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as e:
+                        logger.warning(
+                            "on_complete_callback failed for key %s: %s", key, e
+                        )
         finally:
-            memory_obj.ref_count_down()
+            for obj in memory_objs:
+                obj.ref_count_down()
             with self._put_lock:
-                self._put_tasks.discard(key)
+                for key in keys:
+                    self._put_tasks.discard(key)
 
     def _batched_get_prefix(
         self,

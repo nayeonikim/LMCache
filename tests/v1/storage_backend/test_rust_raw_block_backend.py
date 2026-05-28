@@ -1041,7 +1041,7 @@ def test_rust_raw_block_backend_rejects_when_full(memory_allocator, loop_in_thre
             assert backend.get_blocking(k1) is not None
 
             f3 = backend.batched_submit_put_task([k3], [o3])[0]
-            with pytest.raises(RuntimeError, match="Failed to persist raw-block key"):
+            with pytest.raises(RuntimeError, match="Failed to persist raw-block"):
                 f3.result(timeout=10)
 
             assert backend.get_blocking(k1) is not None
@@ -2269,3 +2269,357 @@ def test_rust_raw_block_backend_batched_get_with_uring(
 
         finally:
             backend.close()
+
+
+def _make_legacy_backend(
+    monkeypatch,
+    *,
+    memory_allocator,
+    loop_in_thread,
+    instance_id: str,
+    dev_path: str,
+) -> "tuple[RustRawBlockBackend, LocalCPUBackend]":
+    """Build a RustRawBlockBackend backed by the in-memory fake raw device.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        memory_allocator: Session-scoped memory allocator fixture.
+        loop_in_thread: Asyncio loop running in a background thread.
+        instance_id: Unique instance id used for the underlying config.
+        dev_path: Backing device path (used only as identifier under the fake).
+
+    Returns:
+        A tuple of (backend, local_cpu_backend). Caller must call
+        ``backend.close()``.
+    """
+    _install_fake_raw_block_device(monkeypatch, size_bytes=64 * 1024 * 1024)
+
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=True,
+        max_local_cpu_size=0.1,
+        lmcache_instance_id=instance_id,
+    )
+    config.storage_plugins = []
+    config.extra_config = {
+        "rust_raw_block.device_path": dev_path,
+        "rust_raw_block.block_align": 4096,
+        "rust_raw_block.header_bytes": 4096,
+        "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
+        "rust_raw_block.meta_enable_periodic": False,
+    }
+    metadata = LMCacheMetadata(
+        model_name="test_model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(4, 2, 256, 8, 128),
+    )
+    local_cpu = LocalCPUBackend(
+        config=config,
+        metadata=metadata,
+        dst_device="cpu",
+        memory_allocator=memory_allocator,
+    )
+    backend = RustRawBlockBackend(
+        config=config,
+        metadata=metadata,
+        local_cpu_backend=local_cpu,
+        loop=loop_in_thread,
+        dst_device="cpu",
+    )
+    return backend, local_cpu
+
+
+def test_batched_submit_put_returns_same_future_per_accepted_key(
+    monkeypatch, memory_allocator, loop_in_thread
+):
+    """All entries in the returned future list refer to the same Future.
+
+    The legacy backend now persists a batch with a single ``put_many`` call;
+    callers that look at any one returned Future see the whole batch's
+    completion.
+    """
+    backend, _ = _make_legacy_backend(
+        monkeypatch,
+        memory_allocator=memory_allocator,
+        loop_in_thread=loop_in_thread,
+        instance_id="test_l2_same_future",
+        dev_path="/tmp/raw-block-l2-same-future",
+    )
+    try:
+        allocator = AdHocMemoryAllocator(device="cpu")
+        keys = [
+            CacheEngineKey("test_model", 1, 0, 5000 + i, torch.bfloat16)
+            for i in range(3)
+        ]
+        objs = []
+        for _ in range(3):
+            obj = allocator.allocate(
+                [torch.Size([2, 16, 8, 128])],
+                [torch.bfloat16],
+                fmt=MemoryFormat.KV_T2D,
+            )
+            assert obj is not None
+            objs.append(obj)
+
+        futs = backend.batched_submit_put_task(keys, objs)
+        assert futs is not None
+        assert len(futs) == 3
+        first = futs[0]
+        assert isinstance(first, Future)
+        assert all(f is first for f in futs)
+        first.result(timeout=10)
+
+        for key in keys:
+            assert backend.contains(key) is True
+        for obj in objs:
+            obj.ref_count_down()
+    finally:
+        backend.close()
+
+
+def test_batched_submit_put_filters_already_indexed_and_inflight(
+    monkeypatch, memory_allocator, loop_in_thread
+):
+    """Indexed keys, inflight keys, and tracked put-task keys are filtered out.
+
+    The submission must only forward the surviving keys to ``put_many`` and
+    return None when nothing survives.
+    """
+    backend, _ = _make_legacy_backend(
+        monkeypatch,
+        memory_allocator=memory_allocator,
+        loop_in_thread=loop_in_thread,
+        instance_id="test_l2_dedup",
+        dev_path="/tmp/raw-block-l2-dedup",
+    )
+    try:
+        allocator = AdHocMemoryAllocator(device="cpu")
+
+        already_indexed_key = CacheEngineKey("test_model", 1, 0, 6001, torch.bfloat16)
+        already_inflight_key = CacheEngineKey("test_model", 1, 0, 6002, torch.bfloat16)
+        already_tracked_key = CacheEngineKey("test_model", 1, 0, 6003, torch.bfloat16)
+        fresh_key = CacheEngineKey("test_model", 1, 0, 6004, torch.bfloat16)
+
+        # Pre-seed the index with already_indexed_key.
+        seed_obj = allocator.allocate(
+            [torch.Size([2, 16, 8, 128])], [torch.bfloat16], fmt=MemoryFormat.KV_T2D
+        )
+        assert seed_obj is not None
+        seed_fut = backend.batched_submit_put_task([already_indexed_key], [seed_obj])
+        assert seed_fut is not None
+        seed_fut[0].result(timeout=10)
+        seed_obj.ref_count_down()
+        assert backend.contains(already_indexed_key) is True
+
+        recorded_specs: list[list[RawBlockKeySpec]] = []
+        original_put_many = backend._core.put_many
+
+        def recording_put_many(specs, objs):
+            recorded_specs.append(list(specs))
+            return original_put_many(specs, objs)
+
+        # Track already_tracked_key in the backend's put-task set so the
+        # dedup filter must drop it.
+        backend._put_tasks.add(already_tracked_key)
+        # Pretend already_inflight_key is currently in the core's inflight set.
+        original_exists_inflight = backend._core.exists_inflight
+
+        def fake_exists_inflight(encoded_key: str) -> bool:
+            if encoded_key == already_inflight_key.to_string():
+                return True
+            return original_exists_inflight(encoded_key)
+
+        # The patch must remain active until the worker thread finishes its
+        # asyncio.to_thread(put_many) call; keep result() inside the with block.
+        with patch.object(backend._core, "put_many", side_effect=recording_put_many):
+            with patch.object(
+                backend._core, "exists_inflight", side_effect=fake_exists_inflight
+            ):
+                fresh_obj = allocator.allocate(
+                    [torch.Size([2, 16, 8, 128])],
+                    [torch.bfloat16],
+                    fmt=MemoryFormat.KV_T2D,
+                )
+                assert fresh_obj is not None
+                # fresh_obj must persist; the other three are filtered out.
+                futs = backend.batched_submit_put_task(
+                    [
+                        already_indexed_key,
+                        already_inflight_key,
+                        already_tracked_key,
+                        fresh_key,
+                    ],
+                    [fresh_obj, fresh_obj, fresh_obj, fresh_obj],
+                )
+                assert futs is not None
+                assert len(futs) == 1
+                futs[0].result(timeout=10)
+                fresh_obj.ref_count_down()
+
+        assert backend.contains(fresh_key) is True
+        # put_many must have been called once with exactly the fresh key.
+        assert len(recorded_specs) == 1
+        assert len(recorded_specs[0]) == 1
+        assert recorded_specs[0][0].encoded == fresh_key.to_string()
+
+        # When every key is filtered out, the call returns None and put_many
+        # is not invoked.
+        recorded_specs.clear()
+        backend._put_tasks.add(fresh_key)
+        try:
+            with patch.object(
+                backend._core, "put_many", side_effect=recording_put_many
+            ):
+                noop = backend.batched_submit_put_task([fresh_key], [fresh_obj])
+            assert noop is None
+            assert recorded_specs == []
+        finally:
+            backend._put_tasks.discard(fresh_key)
+    finally:
+        backend.close()
+
+
+def test_batched_submit_put_partial_failure_logs_and_keeps_others(
+    monkeypatch, memory_allocator, loop_in_thread
+):
+    """Per-key failures inside a batch don't fail the whole future.
+
+    The batch future completes successfully when at least one key persisted;
+    only the failing keys skip the on_complete_callback.
+    """
+    backend, _ = _make_legacy_backend(
+        monkeypatch,
+        memory_allocator=memory_allocator,
+        loop_in_thread=loop_in_thread,
+        instance_id="test_l2_partial_fail",
+        dev_path="/tmp/raw-block-l2-partial-fail",
+    )
+    try:
+        allocator = AdHocMemoryAllocator(device="cpu")
+        keys = [
+            CacheEngineKey("test_model", 1, 0, 7000 + i, torch.bfloat16)
+            for i in range(3)
+        ]
+        objs = []
+        for _ in range(3):
+            obj = allocator.allocate(
+                [torch.Size([2, 16, 8, 128])],
+                [torch.bfloat16],
+                fmt=MemoryFormat.KV_T2D,
+            )
+            assert obj is not None
+            objs.append(obj)
+
+        original_put_many = backend._core.put_many
+
+        def patched_put_many(specs, objs_):
+            real = original_put_many(specs, objs_)
+            # Force the middle entry to look like a failure.
+            real.results[1] = False
+            return real
+
+        completed: list[CacheEngineKey] = []
+
+        def on_complete(k: CacheEngineKey) -> None:
+            completed.append(k)
+
+        with patch.object(backend._core, "put_many", side_effect=patched_put_many):
+            futs = backend.batched_submit_put_task(
+                keys, objs, on_complete_callback=on_complete
+            )
+            assert futs is not None
+            assert len(futs) == 3
+            futs[0].result(timeout=10)
+        for obj in objs:
+            obj.ref_count_down()
+
+        assert completed == [keys[0], keys[2]]
+
+        # All-failure case must surface a RuntimeError on the future.
+        all_fail_keys = [
+            CacheEngineKey("test_model", 1, 0, 7100 + i, torch.bfloat16)
+            for i in range(2)
+        ]
+        all_fail_objs = []
+        for _ in range(2):
+            obj = allocator.allocate(
+                [torch.Size([2, 16, 8, 128])],
+                [torch.bfloat16],
+                fmt=MemoryFormat.KV_T2D,
+            )
+            assert obj is not None
+            all_fail_objs.append(obj)
+
+        def all_fail_put_many(specs, objs_):
+            real = original_put_many(specs, objs_)
+            for i in range(len(real.results)):
+                real.results[i] = False
+            return real
+
+        with patch.object(backend._core, "put_many", side_effect=all_fail_put_many):
+            futs = backend.batched_submit_put_task(all_fail_keys, all_fail_objs)
+            assert futs is not None
+            with pytest.raises(RuntimeError, match="Failed to persist raw-block"):
+                futs[0].result(timeout=10)
+        for obj in all_fail_objs:
+            obj.ref_count_down()
+    finally:
+        backend.close()
+
+
+def test_batched_submit_put_balances_ref_counts_on_exception(
+    monkeypatch, memory_allocator, loop_in_thread
+):
+    """Every accepted obj's ref_count is incremented and decremented exactly once.
+
+    Even when ``put_many`` raises mid-batch, the finally block must release
+    every accepted object and clear the put-task tracking set.
+    """
+    backend, _ = _make_legacy_backend(
+        monkeypatch,
+        memory_allocator=memory_allocator,
+        loop_in_thread=loop_in_thread,
+        instance_id="test_l2_refcount",
+        dev_path="/tmp/raw-block-l2-refcount",
+    )
+    try:
+        allocator = AdHocMemoryAllocator(device="cpu")
+        keys = [
+            CacheEngineKey("test_model", 1, 0, 8000 + i, torch.bfloat16)
+            for i in range(3)
+        ]
+        objs = []
+        for _ in range(3):
+            obj = allocator.allocate(
+                [torch.Size([2, 16, 8, 128])],
+                [torch.bfloat16],
+                fmt=MemoryFormat.KV_T2D,
+            )
+            assert obj is not None
+            objs.append(obj)
+
+        before_refs = [obj.get_ref_count() for obj in objs]
+
+        with patch.object(
+            backend._core,
+            "put_many",
+            side_effect=RuntimeError("simulated put_many crash"),
+        ):
+            futs = backend.batched_submit_put_task(keys, objs)
+            assert futs is not None
+            with pytest.raises(RuntimeError, match="simulated put_many crash"):
+                futs[0].result(timeout=10)
+
+        after_refs = [obj.get_ref_count() for obj in objs]
+        assert before_refs == after_refs, (
+            f"ref_count not balanced: before={before_refs} after={after_refs}"
+        )
+        assert backend.exists_in_put_tasks(keys[0]) is False
+        assert backend.exists_in_put_tasks(keys[1]) is False
+        assert backend.exists_in_put_tasks(keys[2]) is False
+    finally:
+        backend.close()
