@@ -637,6 +637,9 @@ class RawBlockCore:
         if len(keys) != len(objs):
             raise ValueError("keys and objs must have the same length")
 
+        if self.io_engine == "io_uring" and len(keys) > 1:
+            return self._put_many_batch_io(keys, objs)
+
         results = [False] * len(keys)
         stored_keys: list[str] = []
 
@@ -699,6 +702,141 @@ class RawBlockCore:
             results=results,
             stored_keys=stored_keys,
         )
+
+    def _put_many_batch_io(
+        self,
+        keys: Sequence[RawBlockKeySpec],
+        objs: Sequence[MemoryObj],
+    ) -> RawBlockPutManyResult:
+        """Batch I/O path for io_uring: submit all N key writes as 2N SQEs in one call.
+
+        Compared to the sequential ``put_many`` loop, this collapses N separate
+        ``_write_buffers`` calls into a single one with 2N entries so that
+        ``batched_write`` can submit them all in one ``io_uring_submit``, letting
+        NVMe NCQ process them in parallel.
+
+        Failure is all-or-nothing: if ``_write_buffers`` raises, every key in the
+        batch is rolled back. Keys already present in the index are reported as
+        successful without writing (same semantics as the sequential path).
+
+        Args:
+            keys: Raw-block key specs; must have length > 1.
+            objs: Memory objects aligned with ``keys``.
+
+        Returns:
+            Per-key success results and newly stored encoded keys.
+        """
+        results = [False] * len(keys)
+        stored_keys: list[str] = []
+
+        # Phase A: single lock — check index/inflight, allocate N slots
+        write_plan: list[tuple[int, RawBlockKeySpec, MemoryObj, int]] = []
+        with self._lock:
+            for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
+                if self._closed:
+                    break
+                if key.encoded in self._index:
+                    results[i] = True
+                    continue
+                if key.encoded in self._inflight:
+                    continue
+                try:
+                    offset = self._allocate_slot_locked()
+                except RuntimeError:
+                    logger.warning(
+                        "RawBlockCore: no free slot available for key %s",
+                        key.encoded,
+                    )
+                    continue
+                meta = DiskCacheMetadata(
+                    path=f"{self.device_path}@{offset}",
+                    size=len(obj.byte_array),
+                    shape=obj.metadata.shape,
+                    dtype=obj.metadata.dtype,
+                    cached_positions=obj.metadata.cached_positions,
+                    fmt=obj.metadata.fmt,
+                    pin_count=0,
+                )
+                self._inflight[key.encoded] = _Inflight(offset=offset, meta=meta)
+                write_plan.append((i, key, obj, offset))
+
+        if not write_plan:
+            return RawBlockPutManyResult(results=results, stored_keys=stored_keys)
+
+        # Phase B+C: build 2N buffer list and issue one _write_buffers call
+        all_offsets: list[int] = []
+        all_bufs: list[Any] = []
+        all_payload_lens: list[int] = []
+        all_total_lens: list[int] = []
+
+        try:
+            for _, key, obj, offset in write_plan:
+                header = self._encode_header(
+                    key.slot_identity, len(obj.byte_array)
+                )
+                hdr_total = (
+                    round_up(len(header), self.block_align)
+                    if self._requires_transfer_alignment
+                    else len(header)
+                )
+                hdr_payload_len = (
+                    hdr_total if self.io_engine == "io_uring" else len(header)
+                )
+                all_offsets.append(offset)
+                all_bufs.append(header)
+                all_payload_lens.append(hdr_payload_len)
+                all_total_lens.append(hdr_total)
+
+                buf, payload_len, total_len = self._prepare_write_payload(obj)
+                all_offsets.append(offset + self.header_bytes)
+                all_bufs.append(buf)
+                all_payload_lens.append(payload_len)
+                all_total_lens.append(total_len)
+
+            with self._lock:
+                self._inflight_io_count += len(write_plan)
+            try:
+                self._write_buffers(
+                    all_offsets, all_bufs, all_payload_lens, all_total_lens
+                )
+            finally:
+                with self._lock:
+                    self._inflight_io_count -= len(write_plan)
+                    self._last_io_ts = time.monotonic()
+
+            # Phase D: single lock — commit all successfully written keys
+            with self._lock:
+                for i, key, _obj, _offset in write_plan:
+                    inflight = self._inflight.pop(key.encoded, None)
+                    if inflight is None:
+                        continue
+                    if inflight.canceled:
+                        self._append_free_slot_locked(
+                            self._offset_to_slot(int(inflight.offset))
+                        )
+                        self._meta_dirty_total += 1
+                        continue
+                    self._index[key.encoded] = _Entry(
+                        offset=inflight.offset,
+                        size=inflight.meta.size,
+                        meta=inflight.meta,
+                    )
+                    self._meta_dirty_total += 1
+                    results[i] = True
+                    stored_keys.append(key.encoded)
+
+        except Exception as e:
+            logger.error("RawBlockCore batch write failed: %s", e)
+            with self._lock:
+                for _, key, _obj, _offset in write_plan:
+                    inflight = self._inflight.pop(key.encoded, None)
+                    if inflight is not None:
+                        self._append_free_slot_locked(
+                            self._offset_to_slot(int(inflight.offset))
+                        )
+                        self._meta_dirty_total += 1
+
+        return RawBlockPutManyResult(results=results, stored_keys=stored_keys)
 
     def exists_many(
         self,

@@ -3,6 +3,9 @@
 # Future
 from __future__ import annotations
 
+# Standard
+from unittest.mock import patch
+
 # Third Party
 import pytest
 
@@ -123,3 +126,91 @@ def test_raw_block_core_recovers_checkpoint_from_temp_file(tmp_path):
         assert memory_obj_bytes(loaded) == payload
     finally:
         recovered.close()
+
+
+# ---------------------------------------------------------------------------
+# _put_many_batch_io correctness tests
+# These call _put_many_batch_io directly on a posix core to verify
+# slot allocation / commit correctness independent of io_uring availability.
+# ---------------------------------------------------------------------------
+
+
+def test_put_many_batch_io_round_trip(tmp_path):
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    core = RawBlockCore(config, key_namespace="object")
+
+    try:
+        keys = [make_object_key(i) for i in range(10)]
+        specs = [encode_object_key(k) for k in keys]
+        payloads = [bytes([i % 256]) * (512 * (i + 1)) for i in range(10)]
+        objects = [make_memory_obj(p) for p in payloads]
+
+        result = core._put_many_batch_io(specs, objects)
+
+        assert result.results == [True] * 10
+        assert result.stored_keys == [s.encoded for s in specs]
+
+        loaded = [make_empty_memory_obj(len(p)) for p in payloads]
+        assert core.load_many_into([s.encoded for s in specs], loaded) == [True] * 10
+        assert [memory_obj_bytes(o) for o in loaded] == payloads
+    finally:
+        core.close()
+
+
+def test_put_many_batch_io_skips_already_indexed(tmp_path):
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    core = RawBlockCore(config, key_namespace="object")
+
+    try:
+        existing_keys = [make_object_key(i) for i in range(5)]
+        existing_specs = [encode_object_key(k) for k in existing_keys]
+        existing_payloads = [bytes([i]) * 512 for i in range(5)]
+        existing_objs = [make_memory_obj(p) for p in existing_payloads]
+
+        first = core.put_many(existing_specs, existing_objs)
+        assert first.results == [True] * 5
+
+        new_keys = [make_object_key(i) for i in range(5, 10)]
+        new_specs = [encode_object_key(k) for k in new_keys]
+        new_payloads = [bytes([i + 5]) * 512 for i in range(5)]
+        new_objs = [make_memory_obj(p) for p in new_payloads]
+
+        all_specs = existing_specs + new_specs
+        all_objs = existing_objs + new_objs
+        result = core._put_many_batch_io(all_specs, all_objs)
+
+        assert result.results == [True] * 10
+        assert len(result.stored_keys) == 5
+        assert set(result.stored_keys) == {s.encoded for s in new_specs}
+    finally:
+        core.close()
+
+
+def test_put_many_batch_io_write_failure_rolls_back(tmp_path):
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    core = RawBlockCore(config, key_namespace="object")
+
+    try:
+        specs = [encode_object_key(make_object_key(i)) for i in range(5)]
+        objects = [make_memory_obj(bytes([i]) * 512) for i in range(5)]
+
+        free_slots_before = len(core._free_slots) + (
+            core._max_slots - core._next_slot
+        )
+
+        with patch.object(core, "_write_buffers", side_effect=RuntimeError("disk error")):
+            result = core._put_many_batch_io(specs, objects)
+
+        assert result.results == [False] * 5
+        assert result.stored_keys == []
+        assert not core._inflight
+
+        free_slots_after = len(core._free_slots) + (
+            core._max_slots - core._next_slot
+        )
+        assert free_slots_after == free_slots_before
+    finally:
+        core.close()

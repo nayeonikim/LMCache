@@ -379,49 +379,60 @@ class RustRawBlockBackend(StoragePluginInterface):
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> list[Future] | None:
         del transfer_spec
+        if not keys:
+            return None
         loop = self.loop
         if loop is None:
             raise RuntimeError("RustRawBlockBackend requires an asyncio event loop")
 
+        specs = [encode_legacy_key(key) for key in keys]
+        encoded_keys = [spec.encoded for spec in specs]
+
         pending: list[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]] = []
-        for key, obj in zip(keys, objs, strict=False):
-            with self._put_lock:
+        with self._put_lock:
+            indexed_bitmap = self._core.exists_many(encoded_keys, lock=False)
+            for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
                 if key in self._put_tasks:
                     continue
+                if indexed_bitmap[i]:
+                    continue
+                if self._core.exists_inflight(encoded_keys[i]):
+                    continue
                 self._put_tasks.add(key)
-
-            spec = encode_legacy_key(key)
-            exists = self._core.contains_key(
-                spec.encoded,
-                lock=False,
-            ) or self._core.exists_inflight(spec.encoded)
-            if exists:
-                with self._put_lock:
-                    self._put_tasks.discard(key)
-                continue
-
-            obj.ref_count_up()
-            pending.append((key, spec, obj))
+                pending.append((key, specs[i], obj))
 
         if not pending:
             return None
 
-        if self._core.io_engine == "io_uring" and len(pending) > 1:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._submit_put_many(pending, on_complete_callback),
-                loop,
-            )
-            return [fut]
+        upcount = 0
+        try:
+            for _, _, obj in pending:
+                obj.ref_count_up()
+                upcount += 1
 
-        futures: list[Future] = []
-        for key, spec, obj in pending:
-            futures.append(
-                asyncio.run_coroutine_threadsafe(
-                    self._submit_put_one(key, spec, obj, on_complete_callback),
+            if self._core.io_engine == "io_uring" and len(pending) > 1:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._submit_put_many(pending, on_complete_callback),
                     loop,
                 )
-            )
-        return futures
+                return [fut]
+
+            futures: list[Future] = []
+            for key, spec, obj in pending:
+                futures.append(
+                    asyncio.run_coroutine_threadsafe(
+                        self._submit_put_one(key, spec, obj, on_complete_callback),
+                        loop,
+                    )
+                )
+            return futures
+        except Exception:
+            for _, _, obj in pending[:upcount]:
+                obj.ref_count_down()
+            with self._put_lock:
+                for key, _, _ in pending:
+                    self._put_tasks.discard(key)
+            raise
 
     async def _submit_put_one(
         self,
