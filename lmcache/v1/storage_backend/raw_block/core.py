@@ -1435,6 +1435,50 @@ class RawBlockCore:
                 self._inflight_io_count -= 1
                 self._last_io_ts = time.monotonic()
 
+    def _read_slot_headers_batched(
+        self, offsets: list[int]
+    ) -> list[Optional[tuple[int, int]]]:
+        """Read N slot headers in parallel via io_uring batched_read.
+
+        Allocates a single contiguous pointer-aligned buffer to satisfy
+        O_DIRECT requirements, issues one batched_read + wait_iouring, and
+        decodes each header independently.
+
+        Args:
+            offsets: Device byte offsets for each slot to read.
+
+        Returns:
+            Decoded (slot_identity, payload_len) per slot, or None on error.
+            On any I/O exception the entire list is returned as all-None.
+        """
+        n = len(offsets)
+        if n == 0:
+            return []
+
+        align = self.block_align
+        hdr = self.header_bytes
+        raw_buf = bytearray(n * hdr + align - 1)
+        addr = ctypes.addressof(ctypes.c_byte.from_buffer(raw_buf))
+        pad = (-addr) % align
+        views = [
+            memoryview(raw_buf)[pad + i * hdr : pad + (i + 1) * hdr] for i in range(n)
+        ]
+
+        with self._lock:
+            self._inflight_io_count += 1
+        try:
+            raw_dev = self._rawdev()
+            batch_id = raw_dev.batched_read(offsets, views, [hdr] * n)
+            raw_dev.wait_iouring(batch_id)
+        except Exception:
+            return [None] * n
+        finally:
+            with self._lock:
+                self._inflight_io_count -= 1
+                self._last_io_ts = time.monotonic()
+
+        return [self._decode_slot_header(bytes(v)) for v in views]
+
     def _ensure_capacity_and_layout(self) -> None:
         """Open the device if needed and compute metadata/data layout."""
         if self._effective_capacity_bytes > 0 and self._max_slots > 0:
@@ -1880,8 +1924,15 @@ class RawBlockCore:
         with self._lock:
             items = list(self._index.items())
 
-        for encoded_key, entry in items:
-            slot_hdr = self._read_slot_header(int(entry.offset))
+        if self.io_engine == "io_uring" and not self.use_uring_cmd and len(items) > 1:
+            offsets = [int(e.offset) for _, e in items]
+            hdrs: list[Optional[tuple[int, int]]] = self._read_slot_headers_batched(
+                offsets
+            )
+        else:
+            hdrs = [self._read_slot_header(int(e.offset)) for _, e in items]
+
+        for (encoded_key, entry), slot_hdr in zip(items, hdrs, strict=False):
             if slot_hdr is None:
                 to_drop.append(encoded_key)
                 continue
