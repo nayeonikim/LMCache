@@ -5,6 +5,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional
 import ctypes
@@ -43,6 +44,10 @@ _DEFAULT_META_VERSION = 1
 _META_HEADER_STRUCT = struct.Struct("<8sIQQI")
 RAW_BLOCK_IO_ENGINES = frozenset({"posix", "io_uring"})
 DEFAULT_IOURING_QUEUE_DEPTH = 256
+# Slot-header validation issues many small pread calls during POSIX restart
+# recovery. Use a conservative reader count to expose device parallelism without
+# relying on high thread counts; io_uring recovery should use batched reads.
+DEFAULT_RECOVERY_READ_THREADS = 8
 
 
 def round_up(x: int, align: int) -> int:
@@ -222,6 +227,7 @@ class RawBlockCore:
         self.io_engine = normalize_raw_block_io_engine(config.io_engine)
         self.iouring_queue_depth = int(config.iouring_queue_depth)
         self.use_uring_cmd = bool(config.use_uring_cmd)
+        self._recovery_read_threads = DEFAULT_RECOVERY_READ_THREADS
         if self.use_uring_cmd and self.use_odirect:
             logger.warning(
                 "RawBlockCore: use_odirect is ignored for NVMe namespace "
@@ -1876,29 +1882,15 @@ class RawBlockCore:
 
     def _validate_loaded_entries(self) -> None:
         """Drop recovered entries whose slot headers do not match metadata."""
-        to_drop: list[str] = []
         with self._lock:
             items = list(self._index.items())
 
-        for encoded_key, entry in items:
-            slot_hdr = self._read_slot_header(int(entry.offset))
-            if slot_hdr is None:
-                to_drop.append(encoded_key)
-                continue
-            try:
-                expected_identity = slot_identity_from_encoded_key(
-                    encoded_key,
-                    self.key_namespace,
-                )
-            except Exception:
-                to_drop.append(encoded_key)
-                continue
-            slot_identity, payload_len = slot_hdr
-            if int(slot_identity) != int(expected_identity):
-                to_drop.append(encoded_key)
-                continue
-            if int(payload_len) != int(entry.size):
-                to_drop.append(encoded_key)
+        if self.io_engine == "posix" and self._recovery_read_threads > 1 and items:
+            to_drop = self._validate_loaded_entries_posix_parallel(items)
+        elif self.io_engine == "io_uring":
+            to_drop = self._validate_loaded_entries_iouring_serial(items)
+        else:
+            to_drop = self._validate_loaded_entries_serial(items)
 
         if not to_drop:
             return
@@ -1918,6 +1910,94 @@ class RawBlockCore:
             "slot-header validation",
             len(to_drop),
         )
+
+    def _validate_loaded_entries_serial(
+        self,
+        items: list[tuple[str, _Entry]],
+    ) -> list[str]:
+        """Return stale encoded keys using the serial header-read path."""
+        return [
+            encoded_key
+            for encoded_key in map(self._validate_loaded_entry, items)
+            if encoded_key is not None
+        ]
+
+    def _validate_loaded_entries_posix_parallel(
+        self,
+        items: list[tuple[str, _Entry]],
+    ) -> list[str]:
+        """Return stale encoded keys using bounded POSIX reader tasks."""
+        max_workers = min(self._recovery_read_threads, len(items))
+        ranges = self._build_recovery_item_ranges(len(items), max_workers)
+        work_items = [(items, start, end) for start, end in ranges]
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="rawblk-recover",
+        ) as pool:
+            return [
+                encoded_key
+                for dropped in pool.map(
+                    self._validate_loaded_entry_range_posix,
+                    work_items,
+                )
+                for encoded_key in dropped
+            ]
+
+    def _validate_loaded_entries_iouring_serial(
+        self,
+        items: list[tuple[str, _Entry]],
+    ) -> list[str]:
+        """Return stale encoded keys using the current io_uring recovery path."""
+        # TODO: Add io_uring batch recovery here. Reuse
+        # _build_recovery_item_ranges() to bound each batch, read all slot
+        # headers for a range with one batched io_uring submission, then apply
+        # the same identity/size validation used by _validate_loaded_entry().
+        return self._validate_loaded_entries_serial(items)
+
+    def _build_recovery_item_ranges(
+        self,
+        item_count: int,
+        num_ranges: int,
+    ) -> list[tuple[int, int]]:
+        """Build bounded work ranges for recovered checkpoint entries."""
+        range_size = max(1, (item_count + num_ranges - 1) // num_ranges)
+        return [
+            (start, min(start + range_size, item_count))
+            for start in range(0, item_count, range_size)
+        ]
+
+    def _validate_loaded_entry_range_posix(
+        self,
+        work_item: tuple[list[tuple[str, _Entry]], int, int],
+    ) -> list[str]:
+        """Return stale encoded keys from a bounded recovered-entry range."""
+        items, start, end = work_item
+        to_drop: list[str] = []
+        for index in range(start, end):
+            encoded_key = self._validate_loaded_entry(items[index])
+            if encoded_key is not None:
+                to_drop.append(encoded_key)
+        return to_drop
+
+    def _validate_loaded_entry(self, item: tuple[str, _Entry]) -> str | None:
+        """Return the encoded key when its recovered slot header is stale."""
+        encoded_key, entry = item
+        slot_hdr = self._read_slot_header(int(entry.offset))
+        if slot_hdr is None:
+            return encoded_key
+        try:
+            expected_identity = slot_identity_from_encoded_key(
+                encoded_key,
+                self.key_namespace,
+            )
+        except Exception:
+            return encoded_key
+        slot_identity, payload_len = slot_hdr
+        if int(slot_identity) != int(expected_identity):
+            return encoded_key
+        if int(payload_len) != int(entry.size):
+            return encoded_key
+        return None
 
     def _load_checkpoint_from_device(self) -> None:
         """Load the newest valid checkpoint from the raw device if present."""
