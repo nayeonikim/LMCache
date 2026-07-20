@@ -969,6 +969,8 @@ class TestFSNativeL2AdapterConfig:
         assert config.relative_tmp_dir == ""
         assert config.use_odirect is False
         assert config.read_ahead_size is None
+        assert config.write_stream_policy == ""
+        assert config.write_stream_count == 0
 
     def test_from_dict_full(self):
         # First Party
@@ -984,6 +986,8 @@ class TestFSNativeL2AdapterConfig:
                 "relative_tmp_dir": ".tmp",
                 "use_odirect": True,
                 "read_ahead_size": 4096,
+                "write_stream_policy": "kv_rank_worker",
+                "write_stream_count": 4,
             }
         )
         assert config.base_path == "/data/kv_cache"
@@ -991,6 +995,8 @@ class TestFSNativeL2AdapterConfig:
         assert config.relative_tmp_dir == ".tmp"
         assert config.use_odirect is True
         assert config.read_ahead_size == 4096
+        assert config.write_stream_policy == "kv_rank_worker"
+        assert config.write_stream_count == 4
 
     def test_from_dict_missing_base_path_raises(self):
         # First Party
@@ -1106,6 +1112,70 @@ class TestFSNativeL2AdapterConfig:
                 }
             )
 
+    def test_from_dict_invalid_write_stream_policy_raises(self) -> None:
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="write_stream_policy"):
+            FSNativeL2AdapterConfig.from_dict(
+                {
+                    "type": "fs_native",
+                    "base_path": "/tmp/x",
+                    "write_stream_policy": "rank_mod",
+                }
+            )
+
+    def test_from_dict_invalid_write_stream_count_raises(self) -> None:
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="write_stream_count"):
+            FSNativeL2AdapterConfig.from_dict(
+                {
+                    "type": "fs_native",
+                    "base_path": "/tmp/x",
+                    "write_stream_count": -1,
+                }
+            )
+
+    @pytest.mark.parametrize("count", [True, 2**32])
+    def test_from_dict_out_of_range_write_stream_count_raises(
+        self, count: object
+    ) -> None:
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="write_stream_count"):
+            FSNativeL2AdapterConfig.from_dict(
+                {
+                    "type": "fs_native",
+                    "base_path": "/tmp/x",
+                    "write_stream_policy": "kv_rank_worker",
+                    "write_stream_count": count,
+                }
+            )
+
+    def test_from_dict_write_stream_count_without_policy_raises(self) -> None:
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="write_stream_policy"):
+            FSNativeL2AdapterConfig.from_dict(
+                {
+                    "type": "fs_native",
+                    "base_path": "/tmp/x",
+                    "write_stream_count": 4,
+                }
+            )
+
     def test_registered_as_fs_native(self):
         # First Party
         from lmcache.v1.distributed.l2_adapters.config import (
@@ -1126,6 +1196,8 @@ class TestFSNativeL2AdapterConfig:
         assert "num_workers" in h
         assert "use_odirect" in h
         assert "read_ahead_size" in h
+        assert "write_stream_policy" in h
+        assert "write_stream_count" in h
 
     def test_type_name_lookup(self):
         # First Party

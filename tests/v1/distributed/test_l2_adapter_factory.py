@@ -877,17 +877,21 @@ class _FakeLMCacheFSClient:
 
     def __init__(
         self,
-        base_path,
-        num_workers,
-        relative_tmp_dir="",
-        use_odirect=False,
-        read_ahead_size=0,
-    ):
+        base_path: str,
+        num_workers: int,
+        relative_tmp_dir: str = "",
+        use_odirect: bool = False,
+        read_ahead_size: int = 0,
+        write_stream_policy: str = "",
+        write_stream_count: int = 0,
+    ) -> None:
         self.base_path = base_path
         self.num_workers = num_workers
         self.relative_tmp_dir = relative_tmp_dir
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
+        self.write_stream_policy = write_stream_policy
+        self.write_stream_count = write_stream_count
         self._efd = create_event_notifier()
         self._closed = False
 
@@ -973,6 +977,8 @@ class TestFSNativeAdapterFactory:
                 config.relative_tmp_dir,
                 config.use_odirect,
                 config.read_ahead_size or 0,
+                config.write_stream_policy,
+                config.write_stream_count,
             )
             # First Party
             from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
@@ -991,6 +997,8 @@ class TestFSNativeAdapterFactory:
                 relative_tmp_dir=".tmp",
                 use_odirect=True,
                 read_ahead_size=4096,
+                write_stream_policy="kv_rank_worker",
+                write_stream_count=4,
             )
             adapter = create_l2_adapter_from_registry(cfg)
             assert captured["args"] == (
@@ -999,6 +1007,8 @@ class TestFSNativeAdapterFactory:
                 ".tmp",
                 True,
                 4096,
+                "kv_rank_worker",
+                4,
             )
             adapter.close()
         finally:
@@ -1093,6 +1103,8 @@ class TestFSNativeAdapterFactory:
                 config.relative_tmp_dir,
                 config.use_odirect,
                 config.read_ahead_size or 0,
+                config.write_stream_policy,
+                config.write_stream_count,
             )
             # First Party
             from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
@@ -1115,6 +1127,83 @@ class TestFSNativeAdapterFactory:
         finally:
             _L2_ADAPTER_FACTORY_REGISTRY["fs_native"] = old
 
+    @pytest.mark.parametrize(
+        "policy,count",
+        [("", 0), ("kv_rank_worker", 4)],
+    )
+    def test_real_factory_forwards_write_stream_args(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        policy: str,
+        count: int,
+    ) -> None:
+        """The real fs_native factory always forwards the write-stream
+        settings, so the native client is constructed with one signature
+        whether or not the feature is enabled."""
+        # Standard
+        import sys
+        import types
+
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        captured: dict[str, tuple[object, ...]] = {}
+
+        class _CaptureFSClient(_FakeLMCacheFSClient):
+            def __init__(
+                self,
+                base_path: str,
+                num_workers: int,
+                relative_tmp_dir: str = "",
+                use_odirect: bool = False,
+                read_ahead_size: int = 0,
+                write_stream_policy: str = "",
+                write_stream_count: int = 0,
+            ) -> None:
+                super().__init__(
+                    base_path,
+                    num_workers,
+                    relative_tmp_dir,
+                    use_odirect,
+                    read_ahead_size,
+                    write_stream_policy,
+                    write_stream_count,
+                )
+                captured["args"] = (
+                    base_path,
+                    num_workers,
+                    relative_tmp_dir,
+                    use_odirect,
+                    read_ahead_size,
+                    write_stream_policy,
+                    write_stream_count,
+                )
+
+        fake_module = types.ModuleType("lmcache.lmcache_fs")
+        fake_module.LMCacheFSClient = _CaptureFSClient  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "lmcache.lmcache_fs", fake_module)
+
+        cfg = FSNativeL2AdapterConfig(
+            base_path="/tmp/test_ws",
+            write_stream_policy=policy,
+            write_stream_count=count,
+        )
+        adapter = create_l2_adapter_from_registry(cfg)
+        try:
+            assert captured["args"] == (
+                "/tmp/test_ws",
+                4,
+                "",
+                False,
+                0,
+                policy,
+                count,
+            )
+        finally:
+            adapter.close()
+
 
 def _patched_fs_factory(config, l1_memory_desc=None):
     """Factory that uses _FakeLMCacheFSClient instead
@@ -1134,5 +1223,7 @@ def _patched_fs_factory(config, l1_memory_desc=None):
         config.relative_tmp_dir,
         config.use_odirect,
         config.read_ahead_size or 0,
+        config.write_stream_policy,
+        config.write_stream_count,
     )
     return NativeConnectorL2Adapter(client)

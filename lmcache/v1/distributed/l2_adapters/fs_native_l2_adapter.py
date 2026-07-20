@@ -32,6 +32,18 @@ from lmcache.v1.distributed.l2_adapters.factory import (
 
 logger = init_logger(__name__)
 
+_WRITE_STREAM_POLICIES = frozenset({"", "kv_rank_worker"})
+"""Accepted ``write_stream_policy`` values.
+
+``""`` disables write stream hints. ``"kv_rank_worker"`` derives the stream
+from the global worker rank packed into ``ObjectKey.kv_rank`` bits 16-23 by
+:meth:`lmcache.v1.distributed.api.ObjectKey.ComputeKVRank`, so each worker's
+chunks land on a separate stream. Must stay in sync with the policy names
+accepted by the C++ ``FSConnector``.
+"""
+
+_MAX_WRITE_STREAM_COUNT = (1 << 32) - 1
+
 
 class FSNativeL2AdapterConfig(L2AdapterConfigBase):
     """
@@ -45,6 +57,13 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
     - use_odirect: bypass page cache via O_DIRECT.
     - read_ahead_size: trigger filesystem readahead by
       reading this many bytes first (optional).
+    - write_stream_policy: empty disables stream hints; "kv_rank_worker"
+      maps ObjectKey.kv_rank worker bits to write stream IDs. Requires a
+      filesystem supporting FS_IOC_WRITE_STREAM; adapter creation fails
+      otherwise.
+    - write_stream_count: number of streams used for policy mapping
+      (default 0 = query the filesystem for its maximum). Must fit in an
+      unsigned 32-bit integer and is only valid with write_stream_policy.
     """
 
     def __init__(
@@ -55,6 +74,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         use_odirect: bool = False,
         read_ahead_size: Optional[int] = None,
         max_capacity_gb: float = 0,
+        write_stream_policy: str = "",
+        write_stream_count: int = 0,
     ):
         self.base_path = base_path
         self.num_workers = num_workers
@@ -62,6 +83,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
         self.max_capacity_gb = max_capacity_gb
+        self.write_stream_policy = write_stream_policy
+        self.write_stream_count = write_stream_count
 
     @classmethod
     def from_dict(cls, d: dict) -> "FSNativeL2AdapterConfig":
@@ -90,6 +113,26 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
 
+        write_stream_policy = d.get("write_stream_policy", "")
+        if not isinstance(write_stream_policy, str):
+            raise ValueError("write_stream_policy must be a string")
+        if write_stream_policy not in _WRITE_STREAM_POLICIES:
+            raise ValueError(
+                f"write_stream_policy must be one of {sorted(_WRITE_STREAM_POLICIES)}"
+            )
+
+        write_stream_count = d.get("write_stream_count", 0)
+        if (
+            type(write_stream_count) is not int
+            or write_stream_count < 0
+            or write_stream_count > _MAX_WRITE_STREAM_COUNT
+        ):
+            raise ValueError("write_stream_count must be an unsigned 32-bit integer")
+        if write_stream_count and not write_stream_policy:
+            raise ValueError(
+                "write_stream_count requires write_stream_policy to be set"
+            )
+
         return cls(
             base_path=base_path,
             num_workers=num_workers,
@@ -97,6 +140,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             use_odirect=use_odirect,
             read_ahead_size=read_ahead_size,
             max_capacity_gb=float(max_capacity_gb),
+            write_stream_policy=write_stream_policy,
+            write_stream_count=write_stream_count,
         )
 
     @classmethod
@@ -116,7 +161,16 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             "first (optional)\n"
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
-            "(default 0 = disabled)"
+            "(default 0 = disabled)\n"
+            "- write_stream_policy (str): empty disables "
+            "write stream hints; 'kv_rank_worker' maps "
+            "ObjectKey.kv_rank worker bits to stream IDs "
+            "(default empty, requires FS_IOC_WRITE_STREAM "
+            "support)\n"
+            "- write_stream_count (int): number of streams "
+            "for write stream mapping (default 0 = query "
+            "the filesystem maximum, unsigned 32-bit, requires "
+            "write_stream_policy)"
         )
 
 
@@ -150,13 +204,19 @@ def _create_fs_native_l2_adapter(
         config.relative_tmp_dir,
         config.use_odirect,
         config.read_ahead_size or 0,
+        config.write_stream_policy,
+        config.write_stream_count,
     )
     logger.info(
-        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, read_ahead=%s)",
+        "Created FS native L2 adapter: %s "
+        "(workers=%d, odirect=%s, read_ahead=%s, write_stream_policy=%s, "
+        "write_stream_count=%d)",
         config.base_path,
         config.num_workers,
         config.use_odirect,
         config.read_ahead_size,
+        config.write_stream_policy,
+        config.write_stream_count,
     )
     return NativeConnectorL2Adapter(
         native_client,
@@ -167,6 +227,8 @@ def _create_fs_native_l2_adapter(
             "use_odirect": config.use_odirect,
             "num_workers": config.num_workers,
             "read_ahead_size": config.read_ahead_size,
+            "write_stream_policy": config.write_stream_policy,
+            "write_stream_count": config.write_stream_count,
         },
     )
 
