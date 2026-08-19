@@ -10,6 +10,7 @@ import asyncio
 import functools
 import hashlib
 import inspect
+import os
 import re
 import threading
 import traceback
@@ -104,6 +105,47 @@ def cdiv(a: int, b: int) -> int:
 def round_down(x: int, y: int) -> int:
     """Round down x to the nearest multiple of y."""
     return (x // y) * y
+
+
+def write_all(fd: int, data: Union[bytes, bytearray, memoryview]) -> None:
+    """Write every byte of ``data`` to ``fd``, looping on short writes.
+
+    A single ``os.write()`` may accept fewer bytes than it was handed,
+    so callers that need the whole buffer persisted must keep writing
+    the remainder. This mirrors ``write_all()`` in the native FS
+    connector (``csrc/storage_backends/fs/connector.cpp``) and the
+    ``pwrite`` loop in the raw-block backend.
+
+    ``os.write`` already retries on ``EINTR`` (PEP 475), so interrupted
+    calls need no special handling here.
+
+    On an ``O_DIRECT`` descriptor a retry is only valid when the file
+    offset, buffer address and remaining length all stay block-aligned.
+    Linux submits direct I/O in block units, so a short write lands on a
+    block boundary and the retry stays aligned; a hypothetical unaligned
+    short count would surface as ``EINVAL`` from this loop rather than a
+    silently truncated file.
+
+    Args:
+        fd: File descriptor open for writing.
+        data: Buffer to write in full. Must be contiguous.
+
+    Raises:
+        OSError: The write failed, or reported no progress while bytes
+            remained (which would otherwise loop forever).
+    """
+    # ``cast("B")`` makes len() and slicing byte-based: os.write counts
+    # bytes, but len(memoryview) counts elements, which would end the
+    # loop early for any itemsize > 1 buffer.
+    view = memoryview(data).cast("B")
+    total = 0
+    while total < len(view):
+        written = os.write(fd, view[total:])
+        if written <= 0:
+            raise OSError(
+                f"write returned {written} with {len(view) - total} bytes remaining"
+            )
+        total += written
 
 
 def compress_slot_mapping(slots: list[int]) -> list[Union[int, list[int]]]:

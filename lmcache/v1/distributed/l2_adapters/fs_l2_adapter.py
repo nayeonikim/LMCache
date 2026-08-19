@@ -31,6 +31,7 @@ import aiofiles.os
 # First Party
 from lmcache.lmcache_native import Bitmap
 from lmcache.logging import init_logger
+from lmcache.utils import write_all
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import (
@@ -584,7 +585,7 @@ class FSL2Adapter(L2AdapterInterface):
                 os.O_CREAT | os.O_WRONLY | getattr(os, "O_DIRECT", 0),
                 0o644,
             )
-            os.write(fd, buf)
+            write_all(fd, buf)
         except Exception:
             logger.exception("Failed to O_DIRECT write %s", file_path)
             raise

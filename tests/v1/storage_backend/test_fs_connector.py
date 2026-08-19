@@ -14,6 +14,7 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend.connector.fs_connector import FSConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 from tests.v1.utils import create_test_memory_obj
@@ -408,3 +409,77 @@ class TestFSConnector:
 
         new_backend.local_cpu_backend.memory_allocator.close()
         new_backend.close()
+
+
+class TestFSConnectorODirectWrite:
+    """The O_DIRECT put path must write every byte.
+
+    ``os.write`` may accept fewer bytes than it was handed. The read side
+    of this connector already guards the equivalent short read, so the
+    write side must not stop at a partial transfer.
+    """
+
+    def test_odirect_put_persists_all_bytes_on_short_write(
+        self, temp_fs_path, async_loop, memory_allocator, monkeypatch
+    ):
+        # ``save_chunk_meta`` is read from ``local_cpu_backend.config``
+        # (FSConnector passes it to the base class), and O_DIRECT is
+        # switched off at init whenever it is set -- so it must be
+        # disabled here, not just in the connector's own config.
+        config = LMCacheEngineConfig.from_defaults(
+            chunk_size=256,
+            remote_url=f"fs://host:0/{temp_fs_path}",
+            remote_serde="naive",
+            lmcache_instance_id="test_instance",
+            extra_config={
+                "fs_connector_use_odirect": True,
+                "save_chunk_meta": False,
+            },
+        )
+        metadata = create_test_metadata()
+        local_cpu_backend = LocalCPUBackend(
+            config, metadata, memory_allocator=memory_allocator
+        )
+        connector = FSConnector(
+            loop=async_loop,
+            local_cpu_backend=local_cpu_backend,
+            config=config,
+            base_paths_str=temp_fs_path,
+        )
+
+        memory_obj = create_test_memory_obj()
+        payload_size = len(memory_obj.byte_array)
+
+        # Without these the test would silently degrade into a no-op:
+        # the put path falls back to buffered aiofiles when O_DIRECT is
+        # off or the payload is not block aligned.
+        assert connector.use_odirect is True
+        assert connector.os_disk_bs > 0
+        assert payload_size % connector.os_disk_bs == 0
+
+        real_write = os.write
+        calls = []
+
+        def short_write(fd, buf):
+            chunk = bytes(buf)[:4096]
+            calls.append(len(chunk))
+            return real_write(fd, chunk)
+
+        monkeypatch.setattr("lmcache.utils.os.write", short_write)
+
+        key = create_test_key(11)
+        future = asyncio.run_coroutine_threadsafe(
+            connector.put(key, memory_obj), async_loop
+        )
+        future.result(timeout=5.0)
+
+        assert len(calls) > 1, f"expected a looping O_DIRECT write, got {calls}"
+        written = [
+            os.path.join(root, f)
+            for root, _, files in os.walk(temp_fs_path)
+            for f in files
+        ]
+        assert len(written) == 1, f"expected one stored file, got {written}"
+        assert os.path.getsize(written[0]) == payload_size
+
+        memory_allocator.close()

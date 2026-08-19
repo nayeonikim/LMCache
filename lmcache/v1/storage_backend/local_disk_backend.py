@@ -15,7 +15,12 @@ import torch
 from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    DiskCacheMetadata,
+    _lmcache_nvtx_annotate,
+    write_all,
+)
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -727,8 +732,10 @@ class LocalDiskBackend(StorageBackendInterface):
                 f.write(buffer)
         else:
             fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
-            os.write(fd, buffer)
-            os.close(fd)
+            try:
+                write_all(fd, buffer)
+            finally:
+                os.close(fd)
         disk_write_time = time.time() - start_time
         if disk_write_time > 0:
             logger.debug(

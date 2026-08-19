@@ -610,3 +610,54 @@ class TestBatchedGetBlocking:
         results = local_disk_backend.batched_get_blocking([])
         assert results == []
         local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+
+class TestLocalDiskODirectWrite:
+    """``write_file``'s O_DIRECT branch must write every byte.
+
+    ``os.write`` may accept fewer bytes than it was handed; stopping at
+    the first partial transfer would persist a truncated chunk, and
+    ``read_file`` would hand that truncated data back as KV cache.
+    """
+
+    def test_odirect_write_persists_all_bytes_on_short_write(
+        self, temp_disk_path, async_loop, local_cpu_backend, monkeypatch
+    ):
+        config = LMCacheEngineConfig.from_defaults(
+            chunk_size=256,
+            local_disk=temp_disk_path,
+            max_local_disk_size=1.0,
+            lmcache_instance_id="test_instance",
+            extra_config={"use_odirect": True},
+        )
+        backend = LocalDiskBackend(
+            config=config,
+            loop=async_loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device=f"{torch_device_type}:0",
+        )
+
+        # Without these the test would silently degrade into a no-op:
+        # write_file falls back to buffered I/O when O_DIRECT is off or
+        # the payload is not block aligned.
+        assert backend.use_odirect is True
+        assert backend.os_disk_bs > 0
+        payload = bytes(range(256)) * (backend.os_disk_bs * 8 // 256)
+        assert len(payload) % backend.os_disk_bs == 0
+
+        real_write = os.write
+        calls = []
+
+        def short_write(fd, buf):
+            chunk = bytes(buf)[: backend.os_disk_bs]
+            calls.append(len(chunk))
+            return real_write(fd, chunk)
+
+        monkeypatch.setattr("lmcache.utils.os.write", short_write)
+
+        path = os.path.join(temp_disk_path, "odirect_chunk.bin")
+        backend.write_file(payload, path)
+
+        assert len(calls) > 1, f"expected a looping O_DIRECT write, got {calls}"
+        with open(path, "rb") as f:
+            assert f.read() == payload

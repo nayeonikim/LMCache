@@ -3,6 +3,7 @@
 
 # Standard
 from unittest.mock import patch
+import os
 
 # Third Party
 import pytest
@@ -21,6 +22,7 @@ from lmcache.utils import (
     parse_cache_key,
     parse_mixed_slot_mapping,
     round_down,
+    write_all,
 )
 
 
@@ -42,6 +44,95 @@ class TestCdiv:
 
     def test_large_values(self):
         assert cdiv(1000000001, 1000000000) == 2
+
+
+class TestWriteAll:
+    """``write_all`` must not stop at a short write."""
+
+    def test_writes_everything_in_one_pass(self, tmp_path):
+        path = tmp_path / "full.bin"
+        data = b"\xab" * 8192
+        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            write_all(fd, data)
+        finally:
+            os.close(fd)
+        assert path.read_bytes() == data
+
+    def test_loops_until_all_bytes_written(self, tmp_path):
+        """A kernel that accepts only part of the buffer per call."""
+        path = tmp_path / "short.bin"
+        data = bytes(range(256)) * 32  # 8192 bytes
+        real_write = os.write
+        calls = []
+
+        def short_write(fd, buf):
+            chunk = bytes(buf)[:1024]
+            calls.append(len(chunk))
+            return real_write(fd, chunk)
+
+        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            with patch("lmcache.utils.os.write", side_effect=short_write):
+                write_all(fd, data)
+        finally:
+            os.close(fd)
+
+        assert path.read_bytes() == data
+        assert len(calls) > 1, "expected multiple write() calls"
+
+    def test_multibyte_itemsize_view_writes_all_bytes(self, tmp_path):
+        """len(memoryview) counts elements; os.write counts bytes.
+
+        Without an explicit byte cast the loop would stop after
+        ``nbytes / itemsize`` bytes and silently truncate.
+        """
+        # Standard
+        import array
+
+        path = tmp_path / "wide.bin"
+        values = array.array("H", range(1024))  # itemsize 2 -> 2048 bytes
+        expected = values.tobytes()
+        assert len(memoryview(values)) * 2 == len(expected)
+
+        real_write = os.write
+
+        def short_write(fd, buf):
+            # A partial write is what exposes the element/byte mixup: a
+            # single full write would satisfy an element-counted loop by
+            # accident.
+            return real_write(fd, bytes(buf)[:512])
+
+        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            with patch("lmcache.utils.os.write", side_effect=short_write):
+                write_all(fd, memoryview(values))
+        finally:
+            os.close(fd)
+
+        assert path.read_bytes() == expected
+
+    def test_raises_when_no_progress(self, tmp_path):
+        """A write() returning 0 must raise instead of spinning forever."""
+        path = tmp_path / "stuck.bin"
+        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            with patch("lmcache.utils.os.write", return_value=0):
+                with pytest.raises(OSError):
+                    write_all(fd, b"x" * 64)
+        finally:
+            os.close(fd)
+
+    def test_empty_buffer_is_noop(self, tmp_path):
+        path = tmp_path / "empty.bin"
+        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            with patch("lmcache.utils.os.write") as mocked:
+                write_all(fd, b"")
+            mocked.assert_not_called()
+        finally:
+            os.close(fd)
+        assert path.read_bytes() == b""
 
 
 class TestRoundDown:

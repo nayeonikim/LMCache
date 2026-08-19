@@ -11,7 +11,7 @@ import aiofiles.os
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, write_all
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
@@ -314,7 +314,7 @@ class FSConnector(RemoteConnector):
                 os.O_CREAT | os.O_WRONLY | getattr(os, "O_DIRECT", 0),
                 0o644,
             )
-            os.write(fd, buffer)
+            write_all(fd, buffer)
         except Exception as e:
             logger.error("Failed to write to file %s: %s", file_path, e)
             raise
