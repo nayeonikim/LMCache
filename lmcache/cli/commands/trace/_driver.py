@@ -38,10 +38,11 @@ needing to reconstruct thread identities.
 from __future__ import annotations
 
 # Standard
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Callable
 import hashlib
 import json
+import math
 import time
 
 # First Party
@@ -52,6 +53,7 @@ from lmcache.cli.commands.trace._dispatch import (
 )
 from lmcache.cli.commands.trace._stats import ReplayStatsCollector
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.config import (
@@ -67,6 +69,41 @@ if TYPE_CHECKING:
     from lmcache.v1.mp_observability.event_bus import EventBus
 
 logger = init_logger(__name__)
+
+
+def _append_cache_salt_suffix(cache_salt: str, suffix: str) -> str:
+    """Append one replay namespace component to a cache salt."""
+    return suffix if not cache_salt else f"{cache_salt}.{suffix}"
+
+
+def _rewrite_object_key_cache_salts(value: Any, suffix: str) -> Any:
+    """Recursively rewrite ObjectKey salts in decoded trace arguments."""
+    if isinstance(value, ObjectKey):
+        return replace(
+            value,
+            cache_salt=_append_cache_salt_suffix(value.cache_salt, suffix),
+        )
+    if isinstance(value, list):
+        return [_rewrite_object_key_cache_salts(item, suffix) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_rewrite_object_key_cache_salts(item, suffix) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_object_key_cache_salts(item, suffix)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _rewrite_replay_args(args: dict[str, Any], suffix: str) -> dict[str, Any]:
+    """Rewrite all ObjectKeys in one decoded replay argument mapping."""
+    if not suffix:
+        return args
+    return {
+        key: _rewrite_object_key_cache_salts(value, suffix)
+        for key, value in args.items()
+    }
+
 
 #: Default :class:`ObservabilityConfig` for replay sessions.
 #:
@@ -100,6 +137,8 @@ class ReplayResult:
         replay_config_digest: SHA-256 of the replay-side
             StorageManagerConfig, for mismatch comparisons.  Empty
             string if the driver could not compute it.
+        storage_status: Final StorageManager status after store drain and
+            before controller shutdown.
     """
 
     records_replayed: int
@@ -109,6 +148,7 @@ class ReplayResult:
     header_level: str
     header_digest: str
     replay_config_digest: str
+    storage_status: dict[str, Any]
 
 
 class StorageReplayDriver:
@@ -124,6 +164,10 @@ class StorageReplayDriver:
         trace_path: str,
         dispatcher: CallDispatcher | None = None,
         obs_config: ObservabilityConfig = DEFAULT_REPLAY_OBS_CONFIG,
+        time_scale: float = 1.0,
+        replay_cache_salt_suffix: str = "",
+        store_drain_timeout_seconds: float = 60.0,
+        write_reservation_timeout_seconds: float = 0.0,
     ) -> None:
         """Construct a driver.
 
@@ -158,10 +202,63 @@ class StorageReplayDriver:
                 installs this config as the global singleton via
                 :func:`init_observability` and stops the resulting
                 bus on :meth:`close`.
+            time_scale: Positive, finite multiplier applied to recorded
+                monotonic offsets. Values greater than one slow replay.
+            replay_cache_salt_suffix: Optional namespace component appended
+                to every decoded ``ObjectKey.cache_salt`` before dispatch.
+            store_drain_timeout_seconds: Maximum time to wait for queued and
+                in-flight L2 stores after the last trace record.
+            write_reservation_timeout_seconds: Maximum time to retry
+                best-effort ``reserve_write`` misses. Zero preserves the
+                historical one-shot behavior.
         """
+        try:
+            parsed_time_scale = float(time_scale)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("time_scale must be finite and positive") from exc
+        if not math.isfinite(parsed_time_scale) or parsed_time_scale <= 0:
+            raise ValueError("time_scale must be finite and positive")
+        if not isinstance(replay_cache_salt_suffix, str):
+            raise ValueError("replay_cache_salt_suffix must be a string")
+        if replay_cache_salt_suffix:
+            ObjectKey(
+                chunk_hash=b"",
+                model_name="replay-validation",
+                kv_rank=0,
+                cache_salt=replay_cache_salt_suffix,
+            )
+        try:
+            parsed_store_drain_timeout = float(store_drain_timeout_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "store_drain_timeout_seconds must be finite and positive"
+            ) from exc
+        if (
+            not math.isfinite(parsed_store_drain_timeout)
+            or parsed_store_drain_timeout <= 0
+        ):
+            raise ValueError("store_drain_timeout_seconds must be finite and positive")
+        try:
+            parsed_write_reservation_timeout = float(write_reservation_timeout_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "write_reservation_timeout_seconds must be finite and non-negative"
+            ) from exc
+        if (
+            not math.isfinite(parsed_write_reservation_timeout)
+            or parsed_write_reservation_timeout < 0
+        ):
+            raise ValueError(
+                "write_reservation_timeout_seconds must be finite and non-negative"
+            )
+
         self._sm_config = sm_config
         self._trace_path = trace_path
         self._dispatcher = dispatcher or build_default_dispatcher()
+        self._time_scale = parsed_time_scale
+        self._replay_cache_salt_suffix = replay_cache_salt_suffix
+        self._store_drain_timeout_seconds = parsed_store_drain_timeout
+        self._write_reservation_timeout_seconds = parsed_write_reservation_timeout
         self._closed = False
 
         # Each resource is acquired under its own try/except so that a
@@ -206,6 +303,63 @@ class StorageReplayDriver:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+    # ------------------------------------------------------------------
+
+    def _wait_for_store_drain(self) -> None:
+        """Wait until replay-triggered L2 stores are fully complete."""
+        deadline = time.monotonic() + self._store_drain_timeout_seconds
+        consecutive_idle_polls = 0
+        last_status: dict[str, Any] = {}
+        while True:
+            status = self._sm.report_status()
+            if status["num_l2_adapters"] == 0:
+                return
+            last_status = status["store_controller"]
+            active = sum(
+                int(last_status.get(field, 0))
+                for field in (
+                    "pending_keys_count",
+                    "processing_keys_count",
+                    "in_flight_task_count",
+                )
+            )
+            if active == 0:
+                consecutive_idle_polls += 1
+                if consecutive_idle_polls >= 2:
+                    if not self._only_admission_rejections(status):
+                        raise RuntimeError(
+                            "trace replay observed failed L2 store tasks: "
+                            f"{last_status}"
+                        )
+                    return
+            else:
+                consecutive_idle_polls = 0
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "trace replay timed out waiting for L2 stores to drain: "
+                    f"{last_status}"
+                )
+            time.sleep(0.01)
+
+    @staticmethod
+    def _only_admission_rejections(status: dict[str, Any]) -> bool:
+        """Allow failed store completions only when reject counters explain them."""
+        store = status.get("store_controller", {})
+        failed_keys = int(store.get("failed_key_count", 0))
+        if int(store.get("failed_task_count", 0)) == 0:
+            return True
+        adapters = status.get("l2_adapters", [])
+        if not adapters:
+            return False
+        rejected_keys = 0
+        for adapter in adapters:
+            if adapter.get("store_admission_mode") != "reject":
+                return False
+            if int(adapter.get("store_failed_keys_total", 0)) != 0:
+                return False
+            rejected_keys += int(adapter.get("store_rejected_keys_total", 0))
+        return rejected_keys == failed_keys
 
     # ------------------------------------------------------------------
 
@@ -265,7 +419,10 @@ class StorageReplayDriver:
             A :class:`ReplayResult` summarizing the run.
         """
         stats = ReplayStatsCollector()
-        context = ReplayContext(sm=self._sm)
+        context = ReplayContext(
+            sm=self._sm,
+            write_reservation_timeout_seconds=(self._write_reservation_timeout_seconds),
+        )
         header = self._reader.header
         t_start = time.time()
         stats.mark_start(t_start)
@@ -278,13 +435,17 @@ class StorageReplayDriver:
             # offset from the start of replay.  No speedup — if
             # the replay machine is slower than recording, the
             # loop simply runs behind.
-            target = t_wall_origin + record.t_mono
+            target = t_wall_origin + record.t_mono * self._time_scale
             now = time.monotonic()
             if now < target:
                 time.sleep(target - now)
 
             try:
                 decoded_args = codecs.decode_args(record.args)
+                decoded_args = _rewrite_replay_args(
+                    decoded_args,
+                    self._replay_cache_salt_suffix,
+                )
             except Exception:
                 skipped += 1
                 logger.warning(
@@ -314,7 +475,7 @@ class StorageReplayDriver:
                 replayed += 1
                 if on_record is not None:
                     on_record(record.qualname, latency, False)
-            except Exception:
+            except Exception as exc:
                 latency = time.monotonic() - t0
                 stats.record(record.qualname, latency, failed=True)
                 failed += 1
@@ -325,6 +486,8 @@ class StorageReplayDriver:
                 )
                 if on_record is not None:
                     on_record(record.qualname, latency, True)
+                if isinstance(exc, TimeoutError):
+                    raise
 
         # Close any contexts the trace left open (truncated trace,
         # or missing __exit__ records).  Releasing these keeps the
@@ -344,6 +507,8 @@ class StorageReplayDriver:
                     )
             context.open_read_contexts.pop(key_tuple, None)
 
+        self._wait_for_store_drain()
+
         stats.mark_end(time.time())
 
         # Digest of the replay-side config so callers can compare
@@ -362,6 +527,7 @@ class StorageReplayDriver:
             header_level=header.level,
             header_digest=header.sm_config_digest,
             replay_config_digest=replay_digest,
+            storage_status=self._sm.report_status(),
         )
 
 

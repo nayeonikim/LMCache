@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+import time
 from typing import Any, Callable
 
 # First Party
@@ -52,12 +53,16 @@ class ReplayContext:
             ``keys`` tuple.  A dict-of-deques keyed on
             ``tuple(keys)`` supports interleaved contexts across
             different key sets.
+        write_reservation_timeout_seconds: Maximum time to retry keys that
+            ``reserve_write`` could not reserve. Zero preserves the legacy
+            best-effort single-call behavior.
     """
 
     sm: StorageManager
     open_read_contexts: dict[tuple[ObjectKey, ...], deque[AbstractContextManager]] = (
         field(default_factory=dict)
     )
+    write_reservation_timeout_seconds: float = 0.0
 
 
 #: Type of a dispatcher handler: takes a :class:`ReplayContext` and an
@@ -143,8 +148,9 @@ def _call_sm_method(method_name: str) -> Handler:
 
     The returned callable invokes ``getattr(ctx.sm, method_name)(**args)``
     and discards the result.  Used for every "plain" traced method on
-    StorageManager — ``reserve_write``, ``finish_write``,
-    ``submit_prefetch_task``, ``finish_read_prefetched``.
+    StorageManager — ``finish_write`` and ``finish_read_prefetched``.
+    ``reserve_write`` and ``submit_prefetch_task`` have dedicated handlers so
+    evaluation replay can opt into bounded lifecycle handling.
 
     Args:
         method_name: Attribute name on the live StorageManager.
@@ -159,6 +165,48 @@ def _call_sm_method(method_name: str) -> Handler:
 
     _handler.__name__ = f"_call_sm_{method_name}"
     return _handler
+
+
+def _reserve_write(ctx: ReplayContext, args: dict[str, Any]) -> None:
+    """Reserve every requested key when bounded replay backpressure is enabled.
+
+    A zero timeout preserves the historical one-shot best-effort call. With a
+    positive timeout, only keys missing from the previous return mapping are
+    retried. This keeps already-reserved objects write-locked until the trace's
+    matching ``finish_write`` record while allowing asynchronous L2 stores to
+    release enough L1 capacity for the remaining keys.
+
+    Args:
+        ctx: Active replay context containing the timeout policy.
+        args: Decoded ``StorageManager.reserve_write`` arguments.
+
+    Raises:
+        TimeoutError: If any requested key remains unreserved at the deadline.
+    """
+    pending_keys = list(args["keys"])
+    deadline = time.monotonic() + ctx.write_reservation_timeout_seconds
+    while True:
+        call_args = dict(args)
+        call_args["keys"] = pending_keys
+        reserved = ctx.sm.reserve_write(**call_args)
+        if ctx.write_reservation_timeout_seconds == 0:
+            return
+
+        pending_keys = [key for key in pending_keys if key not in reserved]
+        if not pending_keys:
+            return
+        if time.monotonic() >= deadline:
+            try:
+                storage_status = ctx.sm.report_status()
+            except Exception:
+                storage_status = {"status_error": "unavailable"}
+            raise TimeoutError(
+                "trace replay timed out reserving "
+                f"{len(pending_keys)} keys after "
+                f"{ctx.write_reservation_timeout_seconds:g}s; "
+                f"storage_status={storage_status}"
+            )
+        time.sleep(0.01)
 
 
 def _enter_read_prefetched(ctx: ReplayContext, args: dict[str, Any]) -> None:
@@ -228,8 +276,11 @@ def build_default_dispatcher() -> CallDispatcher:
         additional handlers on it for future trace levels.
     """
     dispatcher = CallDispatcher()
+    dispatcher.register(
+        f"{_SM_PREFIX}.reserve_write",
+        _reserve_write,
+    )
     for method_name in (
-        "reserve_write",
         "finish_write",
         "submit_prefetch_task",
         "finish_read_prefetched",

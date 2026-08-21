@@ -85,6 +85,42 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Also export an aggregated JSON summary.",
     )
+    parser.add_argument(
+        "--time-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiply recorded inter-operation timing by this positive value "
+            "(default: 1.0). Values greater than one slow replay down."
+        ),
+    )
+    parser.add_argument(
+        "--replay-cache-salt-suffix",
+        default="",
+        metavar="SUFFIX",
+        help=(
+            "Append SUFFIX to every replayed ObjectKey.cache_salt. "
+            "Use a unique suffix per iteration to generate distinct L2 keys."
+        ),
+    )
+    parser.add_argument(
+        "--store-drain-timeout-seconds",
+        type=float,
+        default=60.0,
+        help=(
+            "Wait up to this many seconds for queued and in-flight L2 stores "
+            "after the final record (default: 60)."
+        ),
+    )
+    parser.add_argument(
+        "--write-reservation-timeout-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Retry best-effort reserve_write misses for up to this many "
+            "seconds. Zero keeps the legacy one-shot behavior (default: 0)."
+        ),
+    )
 
     try:
         # First Party
@@ -216,7 +252,13 @@ def run_trace_replay(args: argparse.Namespace) -> None:
 
     try:
         with StorageReplayDriver(
-            sm_config, args.trace_path, obs_config=obs_config
+            sm_config,
+            args.trace_path,
+            obs_config=obs_config,
+            time_scale=args.time_scale,
+            replay_cache_salt_suffix=args.replay_cache_salt_suffix,
+            store_drain_timeout_seconds=args.store_drain_timeout_seconds,
+            write_reservation_timeout_seconds=(args.write_reservation_timeout_seconds),
         ) as driver:
             result = driver.run(on_record=_on_record)
     finally:
@@ -231,6 +273,14 @@ def run_trace_replay(args: argparse.Namespace) -> None:
         json_path = os.path.join(args.output_dir, "trace_replay_summary.json")
         result.stats.export_json(json_path)
         logger.info("JSON written to %s", json_path)
+        status_path = os.path.join(
+            args.output_dir,
+            "trace_replay_storage_status.json",
+        )
+        with open(status_path, "w", encoding="utf-8") as status_file:
+            json.dump(result.storage_status, status_file, indent=2, sort_keys=True)
+            status_file.write("\n")
+        logger.info("Storage status JSON written to %s", status_path)
 
     if not args.quiet:
         _emit_replay_metrics(result.stats, result)

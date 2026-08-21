@@ -34,6 +34,9 @@ class _FakeSM:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.events: list[str] = []
+        self.prefetch_handle = object()
+        self.prefetch_wait_result = True
+        self.prefetch_result = _FakeBitmap()
 
     def reserve_write(self, **kw: Any) -> dict[Any, Any]:
         self.calls.append(("reserve_write", kw))
@@ -42,14 +45,55 @@ class _FakeSM:
     def finish_write(self, **kw: Any) -> None:
         self.calls.append(("finish_write", kw))
 
-    def submit_prefetch_task(self, **kw: Any) -> None:
+    def submit_prefetch_task(self, **kw: Any) -> object:
         self.calls.append(("submit_prefetch_task", kw))
+        return self.prefetch_handle
+
+    def wait_prefetch_status(self, handle: object, timeout: float) -> bool:
+        self.calls.append(
+            ("wait_prefetch_status", {"handle": handle, "timeout": timeout})
+        )
+        return self.prefetch_wait_result
+
+    def query_prefetch_status(self, handle: object) -> "_FakeBitmap | None":
+        self.calls.append(("query_prefetch_status", {"handle": handle}))
+        return self.prefetch_result
 
     def finish_read_prefetched(self, **kw: Any) -> None:
         self.calls.append(("finish_read_prefetched", kw))
 
+    def report_status(self) -> dict[str, Any]:
+        return {
+            "store_controller": {
+                "pending_keys_count": 0,
+                "processing_keys_count": 0,
+                "in_flight_task_count": 7,
+                "failed_task_count": 0,
+            }
+        }
+
     def read_prefetched_results(self, keys: list[ObjectKey]) -> "_FakeCM":
         return _FakeCM(self, keys)
+
+
+class _SequencedReserveSM(_FakeSM):
+    """Return a configured subset of requested keys on each reserve call."""
+
+    def __init__(self, responses: list[set[ObjectKey]]) -> None:
+        super().__init__()
+        self._responses = iter(responses)
+
+    def reserve_write(self, **kw: Any) -> dict[ObjectKey, object]:
+        self.calls.append(("reserve_write", kw))
+        accepted = next(self._responses, set())
+        return {key: object() for key in kw["keys"] if key in accepted}
+
+
+class _FakeBitmap:
+    """Return the first requested key as the retained prefetch set."""
+
+    def gather(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        return keys[:1]
 
 
 class _FakeCM:
@@ -122,6 +166,55 @@ class TestDefaultDispatcher:
                 {"keys": [_key(1)], "layout_desc": "LAYOUT", "mode": "new"},
             ),
         ]
+
+    def test_reserve_wait_retries_only_missing_keys(self):
+        keys = [_key(1), _key(2)]
+        sm = _SequencedReserveSM([{keys[0]}, {keys[1]}])
+        ctx = ReplayContext(sm=sm, write_reservation_timeout_seconds=1.0)
+
+        build_default_dispatcher().dispatch(
+            f"{_SM_PREFIX}.reserve_write",
+            ctx,
+            {"keys": keys, "layout_desc": "LAYOUT", "mode": "new"},
+        )
+
+        assert [call[1]["keys"] for call in sm.calls] == [keys, [keys[1]]]
+
+    def test_reserve_wait_timeout_is_a_dispatch_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        key = _key(1)
+        sm = _SequencedReserveSM([])
+        ctx = ReplayContext(sm=sm, write_reservation_timeout_seconds=1.0)
+        clock = iter((0.0, 2.0))
+
+        monkeypatch.setattr(
+            "lmcache.cli.commands.trace._dispatch.time.monotonic",
+            lambda: next(clock),
+        )
+
+        with pytest.raises(
+            TimeoutError,
+            match=r"1 keys.*in_flight_task_count.*7",
+        ):
+            build_default_dispatcher().dispatch(
+                f"{_SM_PREFIX}.reserve_write",
+                ctx,
+                {"keys": [key], "layout_desc": "LAYOUT", "mode": "new"},
+            )
+
+    def test_reserve_wait_is_disabled_by_default(self):
+        key = _key(1)
+        sm = _SequencedReserveSM([])
+
+        build_default_dispatcher().dispatch(
+            f"{_SM_PREFIX}.reserve_write",
+            ReplayContext(sm=sm),
+            {"keys": [key], "layout_desc": "LAYOUT", "mode": "new"},
+        )
+
+        assert len(sm.calls) == 1
 
     def test_read_prefetched_enter_exit_fifo(self):
         """Two overlapping contexts with identical keys exit in FIFO order."""

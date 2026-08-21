@@ -39,7 +39,10 @@ from lmcache.v1.distributed.config import (
     L1MemoryManagerConfig,
     StorageManagerConfig,
 )
+from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
+from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2AdapterConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
+from lmcache.v1.distributed.storage_controllers.store_controller import StoreListener
 from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
 from lmcache.v1.mp_observability.trace.decorator import set_tracing_enabled
 from lmcache.v1.mp_observability.trace.recorder import StorageTraceRecorder
@@ -73,6 +76,19 @@ def _make_sm_config() -> StorageManagerConfig:
         l1_manager_config=l1,
         eviction_config=EvictionConfig(eviction_policy="LRU"),
     )
+
+
+def _make_slow_l2_sm_config() -> StorageManagerConfig:
+    config = _make_sm_config()
+    config.l2_adapter_config = L2AdaptersConfig(
+        adapters=[
+            MockL2AdapterConfig(
+                max_size_gb=0.01,
+                mock_bandwidth_gb=0.00001,
+            )
+        ]
+    )
+    return config
 
 
 def _make_key(i: int) -> ObjectKey:
@@ -145,6 +161,23 @@ def _record_sequence(
 
 
 class TestRecordReplayRoundtrip:
+    def test_store_listener_has_no_pending_to_processing_zero_gap(self):
+        listener = StoreListener()
+        keys = [_make_key(i) for i in range(3)]
+        try:
+            listener.on_l1_keys_write_finished(keys)
+
+            assert listener.pending_count() == 3
+            assert listener.processing_count() == 0
+            assert listener.pop_pending_keys() == keys
+            assert listener.pending_count() == 0
+            assert listener.processing_count() == 3
+
+            listener.mark_processed(len(keys))
+            assert listener.processing_count() == 0
+        finally:
+            listener.close()
+
     def test_reserve_and_finish_write_replay(self, trace_path):
         sm_config = _make_sm_config()
         layout = _make_layout()
@@ -161,10 +194,84 @@ class TestRecordReplayRoundtrip:
             result = driver.run()
 
         assert result.records_failed == 0
+        assert result.storage_status["num_l2_adapters"] == 0
+        assert result.storage_status["is_healthy"] is True
         assert result.records_replayed >= 2  # reserve_write + finish_write
         assert result.header_level == "storage"
         # Same config used on both sides → digest matches.
         assert result.header_digest == result.replay_config_digest
+
+    def test_run_waits_for_async_l2_stores(self, trace_path):
+        layout = _make_layout()
+        keys = [_make_key(i) for i in range(3)]
+
+        def script(sm: StorageManager) -> None:
+            reserved = sm.reserve_write(keys, layout, mode="new")
+            assert len(reserved) == len(keys)
+            sm.finish_write(keys)
+
+        _record_sequence(trace_path, _make_sm_config(), script)
+
+        with StorageReplayDriver(_make_slow_l2_sm_config(), trace_path) as driver:
+            result = driver.run()
+            adapter = driver.storage_manager.l2_adapters()[0][1]
+
+            assert all(adapter.debug_has_key(key) for key in keys)
+
+        assert result.records_failed == 0
+
+    def test_store_drain_rejects_async_l2_failures(self, trace_path, monkeypatch):
+        _record_sequence(trace_path, _make_sm_config(), lambda _sm: None)
+
+        with StorageReplayDriver(_make_sm_config(), trace_path) as driver:
+            monkeypatch.setattr(
+                driver.storage_manager,
+                "report_status",
+                lambda: {
+                    "num_l2_adapters": 1,
+                    "store_controller": {
+                        "pending_keys_count": 0,
+                        "processing_keys_count": 0,
+                        "in_flight_task_count": 0,
+                        "failed_task_count": 1,
+                        "failed_key_count": 3,
+                    },
+                },
+            )
+
+            with pytest.raises(RuntimeError, match="failed L2 store tasks"):
+                driver._wait_for_store_drain()
+
+    def test_store_drain_accepts_accounted_admission_rejections(
+        self, trace_path, monkeypatch
+    ):
+        _record_sequence(trace_path, _make_sm_config(), lambda _sm: None)
+        status = {
+            "num_l2_adapters": 1,
+            "store_controller": {
+                "pending_keys_count": 0,
+                "processing_keys_count": 0,
+                "in_flight_task_count": 0,
+                "failed_task_count": 2,
+                "failed_key_count": 3,
+            },
+            "l2_adapters": [
+                {
+                    "store_admission_mode": "reject",
+                    "store_rejected_keys_total": 3,
+                    "store_failed_keys_total": 0,
+                }
+            ],
+        }
+
+        with StorageReplayDriver(_make_sm_config(), trace_path) as driver:
+            monkeypatch.setattr(
+                driver.storage_manager,
+                "report_status",
+                lambda: status,
+            )
+
+            driver._wait_for_store_drain()
 
     def test_full_prefetch_cycle_replay(self, trace_path):
         sm_config = _make_sm_config()
@@ -291,6 +398,80 @@ class TestMismatchHandling:
 
         assert result.records_failed >= 1
 
+    def test_reservation_timeout_aborts_replay(self, trace_path):
+        sm_config = _make_sm_config()
+        layout = _make_layout()
+        keys = [_make_key(0)]
+
+        def script(sm: StorageManager) -> None:
+            sm.reserve_write(keys, layout, mode="new")
+
+        _record_sequence(trace_path, sm_config, script)
+
+        dispatcher = CallDispatcher()
+
+        def _timeout(_ctx: ReplayContext, _args: dict) -> None:
+            raise TimeoutError("reservation stalled")
+
+        dispatcher.register(
+            "lmcache.v1.distributed.storage_manager.StorageManager.reserve_write",
+            _timeout,
+        )
+
+        with (
+            StorageReplayDriver(
+                _make_sm_config(),
+                trace_path,
+                dispatcher=dispatcher,
+            ) as driver,
+            pytest.raises(TimeoutError, match="reservation stalled"),
+        ):
+            driver.run()
+
+
+class TestReplayCacheSaltSuffix:
+    def test_rewrites_object_keys_before_dispatch(self, trace_path):
+        sm_config = _make_sm_config()
+        layout = _make_layout()
+        key = ObjectKey(
+            chunk_hash=b"salted",
+            model_name="test",
+            kv_rank=7,
+            object_group_id=3,
+            cache_salt="tenant",
+        )
+
+        def script(sm: StorageManager) -> None:
+            sm.reserve_write([key], layout, mode="new")
+
+        _record_sequence(trace_path, sm_config, script)
+
+        captured: list[ObjectKey] = []
+        dispatcher = CallDispatcher()
+        dispatcher.register(
+            "lmcache.v1.distributed.storage_manager.StorageManager.reserve_write",
+            lambda _ctx, args: captured.extend(args["keys"]),
+        )
+
+        with StorageReplayDriver(
+            _make_sm_config(),
+            trace_path,
+            dispatcher=dispatcher,
+            replay_cache_salt_suffix="iter-0001",
+        ) as driver:
+            result = driver.run()
+
+        assert result.records_failed == 0
+        assert captured == [
+            ObjectKey(
+                chunk_hash=b"salted",
+                model_name="test",
+                kv_rank=7,
+                object_group_id=3,
+                cache_salt="tenant.iter-0001",
+            )
+        ]
+
 
 class TestPacing:
     def test_replay_does_not_regress_past_monotonic(self, trace_path):
@@ -322,3 +503,55 @@ class TestPacing:
         # Replay should have slept ≈ 50ms at minimum.  Use a generous
         # bound to avoid flakes under load.
         assert elapsed >= 0.04
+
+    def test_time_scale_stretches_recorded_gaps(self, trace_path):
+        sm_config = _make_sm_config()
+        layout = _make_layout()
+        keys = [_make_key(0)]
+
+        def script(sm: StorageManager) -> None:
+            sm.reserve_write(keys, layout, mode="new")
+            time.sleep(0.05)
+            sm.finish_write(keys)
+
+        _record_sequence(trace_path, sm_config, script)
+
+        start = time.monotonic()
+        with StorageReplayDriver(
+            _make_sm_config(), trace_path, time_scale=2.0
+        ) as driver:
+            result = driver.run()
+        elapsed = time.monotonic() - start
+
+        assert result.records_failed == 0
+        assert elapsed >= 0.09
+
+    @pytest.mark.parametrize("time_scale", [0, -1, float("nan"), float("inf")])
+    def test_time_scale_must_be_finite_and_positive(
+        self,
+        trace_path,
+        time_scale,
+    ):
+        with pytest.raises(ValueError, match="time_scale"):
+            StorageReplayDriver(
+                _make_sm_config(),
+                trace_path,
+                time_scale=time_scale,
+            )
+
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        [-1, float("nan"), float("inf")],
+    )
+    def test_write_reservation_timeout_must_be_finite_and_non_negative(
+        self,
+        trace_path,
+        timeout_seconds,
+    ):
+        with pytest.raises(ValueError, match="write_reservation_timeout_seconds"):
+            StorageReplayDriver(
+                _make_sm_config(),
+                trace_path,
+                write_reservation_timeout_seconds=timeout_seconds,
+            )
+
