@@ -882,12 +882,18 @@ class _FakeLMCacheFSClient:
         relative_tmp_dir="",
         use_odirect=False,
         read_ahead_size=0,
+        write_stream_policy="",
+        write_stream_count=0,
+        write_stream_offset=0,
     ):
         self.base_path = base_path
         self.num_workers = num_workers
         self.relative_tmp_dir = relative_tmp_dir
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
+        self.write_stream_policy = write_stream_policy
+        self.write_stream_count = write_stream_count
+        self.write_stream_offset = write_stream_offset
         self._efd = create_event_notifier()
         self._closed = False
 
@@ -973,6 +979,9 @@ class TestFSNativeAdapterFactory:
                 config.relative_tmp_dir,
                 config.use_odirect,
                 config.read_ahead_size or 0,
+                config.write_stream_policy,
+                config.write_stream_count,
+                config.write_stream_offset,
             )
             # First Party
             from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
@@ -991,6 +1000,9 @@ class TestFSNativeAdapterFactory:
                 relative_tmp_dir=".tmp",
                 use_odirect=True,
                 read_ahead_size=4096,
+                write_stream_policy="kv_rank_worker",
+                write_stream_count=7,
+                write_stream_offset=0,
             )
             adapter = create_l2_adapter_from_registry(cfg)
             assert captured["args"] == (
@@ -999,6 +1011,9 @@ class TestFSNativeAdapterFactory:
                 ".tmp",
                 True,
                 4096,
+                "kv_rank_worker",
+                7,
+                0,
             )
             adapter.close()
         finally:
@@ -1093,6 +1108,9 @@ class TestFSNativeAdapterFactory:
                 config.relative_tmp_dir,
                 config.use_odirect,
                 config.read_ahead_size or 0,
+                config.write_stream_policy,
+                config.write_stream_count,
+                config.write_stream_offset,
             )
             # First Party
             from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
@@ -1134,5 +1152,8 @@ def _patched_fs_factory(config, l1_memory_desc=None):
         config.relative_tmp_dir,
         config.use_odirect,
         config.read_ahead_size or 0,
+        config.write_stream_policy,
+        config.write_stream_count,
+        config.write_stream_offset,
     )
     return NativeConnectorL2Adapter(client)

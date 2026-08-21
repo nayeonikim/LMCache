@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -20,6 +21,11 @@ static constexpr const char* PATH_SLASH_REPLACEMENT = "-SEP-";
 static constexpr const char* FILE_EXT = ".data";
 static constexpr const char* TMP_EXT = ".tmp";
 
+enum class WriteStreamPolicy {
+  kDisabled,
+  kKvRankWorker,
+};
+
 // Per-worker connection state for the FS connector.
 // Each worker maintains its own I/O buffer for O_DIRECT.
 struct WorkerFSConn {
@@ -30,14 +36,28 @@ struct WorkerFSConn {
   // If > 0, trigger filesystem readahead by issuing a small
   // initial read of this many bytes before reading the rest.
   size_t read_ahead_size = 0;
+  WriteStreamPolicy write_stream_policy = WriteStreamPolicy::kDisabled;
+  uint32_t write_stream_count = 0;
+  uint32_t write_stream_offset = 0;
 };
 
 class FSConnector : public ConnectorBase<WorkerFSConn> {
  public:
   FSConnector(std::string base_path, int num_workers,
               std::string relative_tmp_dir = "", bool use_odirect = false,
-              size_t read_ahead_size = 0);
+              size_t read_ahead_size = 0,
+              std::string write_stream_policy = "",
+              uint32_t write_stream_count = 0,
+              uint32_t write_stream_offset = 0);
   ~FSConnector() override;
+
+  // Parse kv_rank from the serialized ObjectKey consumed by the connector.
+  static uint64_t parse_kv_rank(const std::string& key);
+
+  // Return the 1-based XFS stream selected from ObjectKey.kv_rank.
+  static uint32_t select_write_stream_id(uint64_t kv_rank,
+                                         uint32_t stream_count,
+                                         uint32_t stream_offset);
 
  protected:
   WorkerFSConn create_connection() override;
@@ -70,16 +90,23 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   // are forbidden from containing '@' (enforced on the Python side), so the
   // parse is unambiguous.
   static std::string key_to_filename(const std::string& key);
+  static std::vector<std::string> split_key(const std::string& key);
 
   static std::string replace_all(const std::string& str,
                                  const std::string& from,
                                  const std::string& to);
+
+  void configure_write_streams(uint32_t requested_count,
+                               uint32_t requested_offset);
 
   std::string base_path_;
   std::string relative_tmp_dir_;
   bool use_odirect_;
   size_t disk_block_size_;
   size_t read_ahead_size_;
+  WriteStreamPolicy write_stream_policy_ = WriteStreamPolicy::kDisabled;
+  uint32_t write_stream_count_ = 0;
+  uint32_t write_stream_offset_ = 0;
 };
 
 }  // namespace connector

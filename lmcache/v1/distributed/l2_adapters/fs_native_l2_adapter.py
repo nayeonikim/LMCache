@@ -10,6 +10,7 @@ Backed by the native C++ filesystem connector wrapped with
 from __future__ import annotations
 
 # Standard
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -45,6 +46,11 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
     - use_odirect: bypass page cache via O_DIRECT.
     - read_ahead_size: trigger filesystem readahead by
       reading this many bytes first (optional).
+    - write_stream_policy: empty disables hints; ``kv_rank_worker`` maps the
+      ObjectKey worker rank to an XFS write stream.
+    - write_stream_count: number of streams in the configured pool. Zero asks
+      the filesystem for the available count when the policy is enabled.
+    - write_stream_offset: number of leading streams excluded from the pool.
     """
 
     def __init__(
@@ -55,6 +61,9 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         use_odirect: bool = False,
         read_ahead_size: Optional[int] = None,
         max_capacity_gb: float = 0,
+        write_stream_policy: str = "",
+        write_stream_count: int = 0,
+        write_stream_offset: int = 0,
     ):
         self.base_path = base_path
         self.num_workers = num_workers
@@ -62,6 +71,9 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
         self.max_capacity_gb = max_capacity_gb
+        self.write_stream_policy = write_stream_policy
+        self.write_stream_count = write_stream_count
+        self.write_stream_offset = write_stream_offset
 
     @classmethod
     def from_dict(cls, d: dict) -> "FSNativeL2AdapterConfig":
@@ -90,6 +102,34 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
 
+        write_stream_policy = d.get("write_stream_policy", "")
+        if not isinstance(write_stream_policy, str) or write_stream_policy not in (
+            "",
+            "kv_rank_worker",
+        ):
+            raise ValueError("write_stream_policy must be empty or 'kv_rank_worker'")
+
+        write_stream_count = d.get("write_stream_count", 0)
+        if (
+            isinstance(write_stream_count, bool)
+            or not isinstance(write_stream_count, int)
+            or write_stream_count < 0
+        ):
+            raise ValueError("write_stream_count must be a non-negative integer")
+
+        write_stream_offset = d.get("write_stream_offset", 0)
+        if (
+            isinstance(write_stream_offset, bool)
+            or not isinstance(write_stream_offset, int)
+            or write_stream_offset < 0
+        ):
+            raise ValueError("write_stream_offset must be a non-negative integer")
+
+        if not write_stream_policy and (write_stream_count or write_stream_offset):
+            raise ValueError(
+                "write_stream_policy is required when a stream pool is configured"
+            )
+
         return cls(
             base_path=base_path,
             num_workers=num_workers,
@@ -97,6 +137,9 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             use_odirect=use_odirect,
             read_ahead_size=read_ahead_size,
             max_capacity_gb=float(max_capacity_gb),
+            write_stream_policy=write_stream_policy,
+            write_stream_count=write_stream_count,
+            write_stream_offset=write_stream_offset,
         )
 
     @classmethod
@@ -116,7 +159,13 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             "first (optional)\n"
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
-            "(default 0 = disabled)"
+            "(default 0 = disabled)\n"
+            "- write_stream_policy (str): empty disables hints; "
+            "'kv_rank_worker' maps worker ranks to streams\n"
+            "- write_stream_count (int): streams in the placement pool; "
+            "0 uses the filesystem maximum (default 0)\n"
+            "- write_stream_offset (int): leading streams excluded from "
+            "the placement pool (default 0)"
         )
 
 
@@ -143,13 +192,17 @@ def _create_fs_native_l2_adapter(
         NativeConnectorL2Adapter,
     )
 
-    assert isinstance(config, FSNativeL2AdapterConfig)
+    if not isinstance(config, FSNativeL2AdapterConfig):
+        raise TypeError("config must be an FSNativeL2AdapterConfig")
     native_client = LMCacheFSClient(
         config.base_path,
         config.num_workers,
         config.relative_tmp_dir,
         config.use_odirect,
         config.read_ahead_size or 0,
+        config.write_stream_policy,
+        config.write_stream_count,
+        config.write_stream_offset,
     )
     logger.info(
         "Created FS native L2 adapter: %s (workers=%d, odirect=%s, read_ahead=%s)",
@@ -167,6 +220,9 @@ def _create_fs_native_l2_adapter(
             "use_odirect": config.use_odirect,
             "num_workers": config.num_workers,
             "read_ahead_size": config.read_ahead_size,
+            "write_stream_policy": config.write_stream_policy,
+            "write_stream_count": config.write_stream_count,
+            "write_stream_offset": config.write_stream_offset,
         },
     )
 

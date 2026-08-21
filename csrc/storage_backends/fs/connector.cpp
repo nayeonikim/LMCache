@@ -1,14 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "connector.h"
+#include "write_stream_compat.h"
+#include <charconv>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace lmcache {
 namespace connector {
+
+namespace {
+
+uint32_t get_max_write_streams(int fd) {
+  struct fs_write_stream stream = {};
+  stream.op_flags = FS_WRITE_STREAM_OP_GET_MAX;
+  if (::ioctl(fd, FS_IOC_WRITE_STREAM, &stream) != 0) {
+    throw std::runtime_error("FS_IOC_WRITE_STREAM GET_MAX failed: " +
+                             std::string(strerror(errno)));
+  }
+  return stream.max_streams;
+}
+
+uint32_t get_write_stream(int fd) {
+  struct fs_write_stream stream = {};
+  stream.op_flags = FS_WRITE_STREAM_OP_GET;
+  if (::ioctl(fd, FS_IOC_WRITE_STREAM, &stream) != 0) {
+    throw std::runtime_error("FS_IOC_WRITE_STREAM GET failed: " +
+                             std::string(strerror(errno)));
+  }
+  return stream.stream_id;
+}
+
+void set_write_stream(int fd, uint32_t stream_id) {
+  struct fs_write_stream stream = {};
+  stream.op_flags = FS_WRITE_STREAM_OP_SET;
+  stream.stream_id = stream_id;
+  if (::ioctl(fd, FS_IOC_WRITE_STREAM, &stream) != 0) {
+    throw std::runtime_error("FS_IOC_WRITE_STREAM SET failed for stream " +
+                             std::to_string(stream_id) + ": " +
+                             std::string(strerror(errno)));
+  }
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------
 // Helpers
@@ -24,6 +63,53 @@ std::string FSConnector::replace_all(const std::string& str,
     pos += to.size();
   }
   return result;
+}
+
+std::vector<std::string> FSConnector::split_key(const std::string& key) {
+  std::vector<std::string> parts;
+  size_t start = 0;
+  for (size_t pos = 0; pos <= key.size(); ++pos) {
+    if (pos == key.size() || key[pos] == KEY_SEP) {
+      parts.emplace_back(key.substr(start, pos - start));
+      start = pos + 1;
+    }
+  }
+  if (parts.size() != 4 && parts.size() != 5) {
+    throw std::runtime_error(
+        "FSConnector: malformed key (expected 4 or 5 '@'-separated fields): " +
+        key);
+  }
+  return parts;
+}
+
+uint64_t FSConnector::parse_kv_rank(const std::string& key) {
+  std::vector<std::string> parts = split_key(key);
+  const std::string& kv_rank_hex = parts[1];
+  uint64_t kv_rank = 0;
+  auto [end, error] = std::from_chars(
+      kv_rank_hex.data(), kv_rank_hex.data() + kv_rank_hex.size(), kv_rank, 16);
+  if (error != std::errc() || end != kv_rank_hex.data() + kv_rank_hex.size()) {
+    throw std::runtime_error("FSConnector: invalid kv_rank in key: " + key);
+  }
+  return kv_rank;
+}
+
+uint32_t FSConnector::select_write_stream_id(uint64_t kv_rank,
+                                             uint32_t stream_count,
+                                             uint32_t stream_offset) {
+  if (stream_count == 0) {
+    throw std::runtime_error(
+        "FSConnector: write stream count must be positive");
+  }
+
+  uint32_t worker_index = (static_cast<uint32_t>(kv_rank) >> 16) & 0xff;
+  uint64_t stream_id = static_cast<uint64_t>(stream_offset) +
+                       (worker_index % stream_count) + 1;
+  if (stream_id > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        "FSConnector: selected write stream overflows uint32");
+  }
+  return static_cast<uint32_t>(stream_id);
 }
 
 std::string FSConnector::key_to_filename(const std::string& key) {
@@ -46,20 +132,7 @@ std::string FSConnector::key_to_filename(const std::string& key) {
   // '@' (invariant enforced on the Python side), so splitting on '@'
   // is unambiguous — no marker, no rsplit.
 
-  // Split on '@' — must yield 4 (unsalted) or 5 (salted) fields.
-  std::vector<std::string> parts;
-  size_t start = 0;
-  for (size_t pos = 0; pos <= key.size(); ++pos) {
-    if (pos == key.size() || key[pos] == KEY_SEP) {
-      parts.emplace_back(key.substr(start, pos - start));
-      start = pos + 1;
-    }
-  }
-  if (parts.size() != 4 && parts.size() != 5) {
-    throw std::runtime_error(
-        "FSConnector: malformed key (expected 4 or 5 '@'-separated fields): " +
-        key);
-  }
+  std::vector<std::string> parts = split_key(key);
 
   const std::string& model_name = parts[0];
   const std::string& kv_rank_hex = parts[1];
@@ -154,13 +227,28 @@ static bool try_enable_odirect(int& flags, const void* buf, size_t len,
 
 FSConnector::FSConnector(std::string base_path, int num_workers,
                          std::string relative_tmp_dir, bool use_odirect,
-                         size_t read_ahead_size)
+                         size_t read_ahead_size,
+                         std::string write_stream_policy,
+                         uint32_t write_stream_count,
+                         uint32_t write_stream_offset)
     : ConnectorBase(num_workers),
       base_path_(std::move(base_path)),
       relative_tmp_dir_(std::move(relative_tmp_dir)),
       use_odirect_(use_odirect),
       disk_block_size_(0),
       read_ahead_size_(read_ahead_size) {
+  if (write_stream_policy.empty()) {
+    if (write_stream_count != 0 || write_stream_offset != 0) {
+      throw std::runtime_error(
+          "FSConnector: write stream policy is required for a stream pool");
+    }
+  } else if (write_stream_policy == "kv_rank_worker") {
+    write_stream_policy_ = WriteStreamPolicy::kKvRankWorker;
+  } else {
+    throw std::runtime_error("FSConnector: unsupported write stream policy: " +
+                             write_stream_policy);
+  }
+
   // Create base directory
   std::filesystem::create_directories(base_path_);
 
@@ -168,6 +256,10 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
   if (!relative_tmp_dir_.empty()) {
     auto tmp_path = std::filesystem::path(base_path_) / relative_tmp_dir_;
     std::filesystem::create_directories(tmp_path);
+  }
+
+  if (write_stream_policy_ != WriteStreamPolicy::kDisabled) {
+    configure_write_streams(write_stream_count, write_stream_offset);
   }
 
   // Query disk block size for O_DIRECT
@@ -192,7 +284,69 @@ WorkerFSConn FSConnector::create_connection() {
   conn.use_odirect = use_odirect_;
   conn.disk_block_size = disk_block_size_;
   conn.read_ahead_size = read_ahead_size_;
+  conn.write_stream_policy = write_stream_policy_;
+  conn.write_stream_count = write_stream_count_;
+  conn.write_stream_offset = write_stream_offset_;
   return conn;
+}
+
+void FSConnector::configure_write_streams(uint32_t requested_count,
+                                          uint32_t requested_offset) {
+  auto probe_template =
+      std::filesystem::path(base_path_) / ".lmcache-write-stream-probe-XXXXXX";
+  std::string probe_text = probe_template.string();
+  std::vector<char> probe_path(probe_text.begin(), probe_text.end());
+  probe_path.push_back('\0');
+
+  int fd = ::mkstemp(probe_path.data());
+  if (fd < 0) {
+    throw std::runtime_error(
+        "FSConnector: write stream probe creation failed: " +
+        std::string(strerror(errno)));
+  }
+
+  std::filesystem::path created_path(probe_path.data());
+  try {
+    uint32_t max_streams = get_max_write_streams(fd);
+    if (max_streams == 0) {
+      throw std::runtime_error(
+          "FSConnector: filesystem reports zero write streams");
+    }
+
+    uint64_t pool_end = static_cast<uint64_t>(requested_offset) +
+                        static_cast<uint64_t>(requested_count);
+    if (requested_count == 0) {
+      if (requested_offset >= max_streams) {
+        throw std::runtime_error(
+            "FSConnector: write stream offset leaves no available streams");
+      }
+      write_stream_count_ = max_streams - requested_offset;
+    } else {
+      if (pool_end > max_streams) {
+        throw std::runtime_error(
+            "FSConnector: configured write stream pool exceeds filesystem "
+            "maximum");
+      }
+      write_stream_count_ = requested_count;
+    }
+    write_stream_offset_ = requested_offset;
+
+    uint32_t probe_stream = write_stream_offset_ + 1;
+    set_write_stream(fd, probe_stream);
+    if (get_write_stream(fd) != probe_stream) {
+      throw std::runtime_error(
+          "FSConnector: filesystem did not retain the probe write stream");
+    }
+  } catch (...) {
+    ::close(fd);
+    std::error_code remove_error;
+    std::filesystem::remove(created_path, remove_error);
+    throw;
+  }
+
+  ::close(fd);
+  std::error_code remove_error;
+  std::filesystem::remove(created_path, remove_error);
 }
 
 void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
@@ -274,6 +428,12 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
   }
 
   try {
+    if (conn.write_stream_policy == WriteStreamPolicy::kKvRankWorker) {
+      uint32_t stream_id =
+          select_write_stream_id(parse_kv_rank(key), conn.write_stream_count,
+                                 conn.write_stream_offset);
+      set_write_stream(fd, stream_id);
+    }
     write_all(fd, buf, len);
   } catch (...) {
     ::close(fd);
