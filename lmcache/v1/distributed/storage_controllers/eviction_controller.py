@@ -212,7 +212,47 @@ class L2AdapterEvictionState:
         self.eviction_config = eviction_config
         self.eviction_policy = CreateEvictionPolicy(eviction_config)
         self.listener = L2EvictionPolicy(self.eviction_policy)
+        self._status_lock = threading.Lock()
+        self._trigger_count = 0
+        self._delete_requested_keys_total = 0
+        self._delete_succeeded_keys_total = 0
+        self._delete_failed_keys_total = 0
         adapter.register_listener(self.listener)
+
+    def record_trigger(self) -> None:
+        """Record that this adapter crossed its eviction threshold."""
+        with self._status_lock:
+            self._trigger_count += 1
+
+    def record_delete_result(self, requested_keys: int, succeeded: bool) -> None:
+        """Record the outcome of one adapter delete call.
+
+        Args:
+            requested_keys: Number of keys supplied to the adapter.
+            succeeded: Whether the adapter delete call completed without an
+                exception.
+        """
+        with self._status_lock:
+            self._delete_requested_keys_total += requested_keys
+            if succeeded:
+                self._delete_succeeded_keys_total += requested_keys
+            else:
+                self._delete_failed_keys_total += requested_keys
+
+    def report_operation_status(self) -> dict[str, int]:
+        """Return cumulative eviction and delete counters for this adapter.
+
+        Returns:
+            A dictionary containing trigger count and requested, succeeded,
+            and failed delete-key totals.
+        """
+        with self._status_lock:
+            return {
+                "trigger_count": self._trigger_count,
+                "delete_requested_keys_total": self._delete_requested_keys_total,
+                "delete_succeeded_keys_total": self._delete_succeeded_keys_total,
+                "delete_failed_keys_total": self._delete_failed_keys_total,
+            }
 
 
 class L2EvictionController(StorageControllerInterface):
@@ -241,6 +281,9 @@ class L2EvictionController(StorageControllerInterface):
         # Guards _adapter_states against concurrent runtime add/remove.
         self._states_lock = threading.Lock()
         self._stop_flag = threading.Event()
+        self._pass_in_progress = threading.Event()
+        self._pass_status_lock = threading.Lock()
+        self._completed_passes_total = 0
         self._thread = threading.Thread(
             target=self._eviction_loop,
             daemon=True,
@@ -271,7 +314,18 @@ class L2EvictionController(StorageControllerInterface):
                 s for s in self._adapter_states if s.adapter_id != adapter_id
             ]
 
-    def report_status(self) -> dict:
+    def report_status(self) -> dict[str, object]:
+        """Return controller health, pass state, usage, and delete outcomes.
+
+        The method waits for the current adapter pass to release
+        ``_states_lock`` before reading adapter usage. Callers can therefore
+        combine ``pass_in_progress == False`` with stable cumulative counters
+        to establish a round-boundary quiescence barrier.
+
+        Returns:
+            A dictionary containing controller health, pass counters, and one
+            status dictionary per eviction-enabled adapter.
+        """
         # NOTE: ``usage.bytes_by_cache_salt`` is intentionally NOT
         # surfaced here. A deployment can have 10k+ salts, so embedding
         # the full bucket map in the status response would blow up the
@@ -285,6 +339,7 @@ class L2EvictionController(StorageControllerInterface):
             usage = state.adapter.get_usage()
             adapter_statuses.append(
                 {
+                    "adapter_id": state.adapter_id,
                     "eviction_policy": state.eviction_config.eviction_policy,
                     "trigger_watermark": state.eviction_config.trigger_watermark,
                     "eviction_ratio": state.eviction_config.eviction_ratio,
@@ -292,23 +347,34 @@ class L2EvictionController(StorageControllerInterface):
                     "total_bytes_used": usage.total_bytes_used,
                     "total_capacity_bytes": usage.total_capacity_bytes,
                     "num_cache_salt_buckets": len(usage.bytes_by_cache_salt),
+                    **state.report_operation_status(),
                 }
             )
+        with self._pass_status_lock:
+            completed_passes_total = self._completed_passes_total
         return {
             "is_healthy": self._thread.is_alive(),
             "thread_alive": self._thread.is_alive(),
+            "pass_in_progress": self._pass_in_progress.is_set(),
+            "completed_passes_total": completed_passes_total,
             "adapters": adapter_statuses,
         }
 
     def _eviction_loop(self):
         while not self._stop_flag.is_set():
             time.sleep(1)
-            # Hold the lock across the whole pass so remove_adapter_state
-            # cannot detach (and the caller close) an adapter while we are
-            # calling into it.
-            with self._states_lock:
-                for state in self._adapter_states:
-                    self._check_and_evict(state)
+            self._pass_in_progress.set()
+            try:
+                # Hold the lock across the whole pass so remove_adapter_state
+                # cannot detach (and the caller close) an adapter while we are
+                # calling into it.
+                with self._states_lock:
+                    for state in self._adapter_states:
+                        self._check_and_evict(state)
+            finally:
+                with self._pass_status_lock:
+                    self._completed_passes_total += 1
+                self._pass_in_progress.clear()
 
     def _check_and_evict(self, state: L2AdapterEvictionState):
         if state.eviction_policy.support_isolation and self._quota_manager is not None:
@@ -340,9 +406,10 @@ class L2EvictionController(StorageControllerInterface):
             current_usage,
             watermark,
         )
+        state.record_trigger()
         actions = state.eviction_policy.get_eviction_actions(eviction_ratio)
         for action in actions:
-            self._execute_eviction_action(state.adapter, action)
+            self._execute_eviction_action(state, action)
 
     def _check_and_evict_by_cache_salt(self, state: L2AdapterEvictionState):
         """Per-``cache_salt`` eviction driven by :class:`QuotaManager`.
@@ -397,21 +464,29 @@ class L2EvictionController(StorageControllerInterface):
             for action in actions:
                 pending.setdefault(action.destination, []).extend(action.keys)
 
+        if pending:
+            state.record_trigger()
         for destination, keys in pending.items():
             self._execute_eviction_action(
-                state.adapter,
+                state,
                 EvictionAction(keys=keys, destination=destination),
             )
 
     def _execute_eviction_action(
-        self, adapter: L2AdapterInterface, action: EvictionAction
-    ):
-        if action.destination == EvictionDestination.DISCARD:
-            adapter.delete(action.keys)
-        else:
-            logger.error("Unsupported eviction destination: %s", action.destination)
-            logger.error("Treating it as DISCARD.")
-            adapter.delete(action.keys)
+        self, state: L2AdapterEvictionState, action: EvictionAction
+    ) -> None:
+        requested_keys = len(action.keys)
+        try:
+            if action.destination == EvictionDestination.DISCARD:
+                state.adapter.delete(action.keys)
+            else:
+                logger.error("Unsupported eviction destination: %s", action.destination)
+                logger.error("Treating it as DISCARD.")
+                state.adapter.delete(action.keys)
+        except Exception:
+            state.record_delete_result(requested_keys, succeeded=False)
+            raise
+        state.record_delete_result(requested_keys, succeeded=True)
 
         if action.keys:
             get_event_bus().publish(

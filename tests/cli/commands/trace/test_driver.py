@@ -273,6 +273,44 @@ class TestRecordReplayRoundtrip:
 
             driver._wait_for_store_drain()
 
+    def test_prefetch_drain_ignores_completed_results(self, trace_path, monkeypatch):
+        _record_sequence(trace_path, _make_sm_config(), lambda _sm: None)
+        status = {
+            "prefetch_controller": {
+                "submission_queue_size": 0,
+                "pending_queue_size": 0,
+                "in_flight_request_count": 0,
+                "lookup_phase_count": 0,
+                "load_phase_count": 0,
+                "completed_results_count": 7,
+            }
+        }
+
+        with StorageReplayDriver(_make_sm_config(), trace_path) as driver:
+            monkeypatch.setattr(
+                driver.storage_manager,
+                "report_status",
+                lambda: status,
+            )
+
+            driver._wait_for_prefetch_completion()
+
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        [0, -1, float("nan"), float("inf")],
+    )
+    def test_prefetch_completion_timeout_must_be_finite_and_positive(
+        self,
+        trace_path,
+        timeout_seconds,
+    ):
+        with pytest.raises(ValueError, match="prefetch_completion_timeout_seconds"):
+            StorageReplayDriver(
+                _make_sm_config(),
+                trace_path,
+                prefetch_completion_timeout_seconds=timeout_seconds,
+            )
+
     def test_full_prefetch_cycle_replay(self, trace_path):
         sm_config = _make_sm_config()
         layout = _make_layout()
@@ -472,6 +510,47 @@ class TestReplayCacheSaltSuffix:
             )
         ]
 
+    def test_replays_multiple_rounds_with_one_storage_manager(self, trace_path):
+        sm_config = _make_sm_config()
+        layout = _make_layout()
+        key = ObjectKey(
+            chunk_hash=b"repeatable",
+            model_name="test",
+            kv_rank=7,
+            object_group_id=3,
+            cache_salt="tenant",
+        )
+
+        def script(sm: StorageManager) -> None:
+            sm.reserve_write([key], layout, mode="new")
+
+        _record_sequence(trace_path, sm_config, script)
+
+        captured: list[ObjectKey] = []
+        dispatcher = CallDispatcher()
+        dispatcher.register(
+            "lmcache.v1.distributed.storage_manager.StorageManager.reserve_write",
+            lambda _ctx, args: captured.extend(args["keys"]),
+        )
+
+        with StorageReplayDriver(
+            _make_sm_config(),
+            trace_path,
+            dispatcher=dispatcher,
+        ) as driver:
+            manager_identity = id(driver.storage_manager)
+            first = driver.run(replay_cache_salt_suffix="round-0001")
+            second = driver.run(replay_cache_salt_suffix="round-0002")
+
+            assert id(driver.storage_manager) == manager_identity
+
+        assert first.records_replayed == second.records_replayed == 1
+        assert first.records_failed == second.records_failed == 0
+        assert [item.cache_salt for item in captured] == [
+            "tenant.round-0001",
+            "tenant.round-0002",
+        ]
+
 
 class TestPacing:
     def test_replay_does_not_regress_past_monotonic(self, trace_path):
@@ -554,4 +633,3 @@ class TestPacing:
                 trace_path,
                 write_reservation_timeout_seconds=timeout_seconds,
             )
-

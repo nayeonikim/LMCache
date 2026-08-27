@@ -8,8 +8,10 @@ C++ IStorageConnector interface, so no Redis or C++ build is needed.
 
 # Standard
 import ctypes
+import gc
 import select
 import threading
+import weakref
 
 # Third Party
 import pytest
@@ -153,6 +155,33 @@ class MockNativeConnector:
             self._efd.notify()
         except OSError:
             pass
+
+
+class DeferredNativeConnector(MockNativeConnector):
+    """Native-like connector that retains pointers neither for store nor load."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending_future_ids: list[int] = []
+
+    def submit_batch_set(self, keys: list[str], memoryviews: list) -> int:
+        with self._lock:
+            fid = self._next_id
+            self._next_id += 1
+            self.pending_future_ids.append(fid)
+        return fid
+
+    def submit_batch_get(self, keys: list[str], memoryviews: list) -> int:
+        with self._lock:
+            fid = self._next_id
+            self._next_id += 1
+            self.pending_future_ids.append(fid)
+        return fid
+
+    def complete_pending(self) -> None:
+        with self._lock:
+            fid = self.pending_future_ids.pop(0)
+        self._push_completion(fid, True, "", None)
 
 
 # =============================================================================
@@ -489,6 +518,50 @@ class TestStoreInterface:
         completed = adapter.pop_completed_store_tasks()
         assert completed[task_id].is_successful()
 
+    def test_failed_store_preserves_native_error(self):
+        class FailingStoreConnector(MockNativeConnector):
+            def submit_batch_set(self, keys: list[str], memoryviews: list) -> int:
+                with self._lock:
+                    fid = self._next_id
+                    self._next_id += 1
+                self._push_completion(fid, False, "native EFAULT", None)
+                return fid
+
+        client = FailingStoreConnector()
+        adapter = NativeConnectorL2Adapter(client)
+        try:
+            task_id = adapter.submit_store_task(
+                [create_object_key(1)],
+                [create_memory_obj()],
+            )
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+            assert not adapter.pop_completed_store_tasks()[task_id].is_successful()
+
+            status = adapter.report_status()
+            assert status["last_native_errors"]["store"] == "native EFAULT"
+        finally:
+            adapter.close()
+
+    def test_store_keeps_memory_object_alive_until_native_completion(self):
+        client = DeferredNativeConnector()
+        adapter = NativeConnectorL2Adapter(client)
+        try:
+            obj = create_memory_obj()
+            obj_ref = weakref.ref(obj)
+            task_id = adapter.submit_store_task([create_object_key(1)], [obj])
+
+            del obj
+            gc.collect()
+            assert obj_ref() is not None
+
+            client.complete_pending()
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+            assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+            gc.collect()
+            assert obj_ref() is None
+        finally:
+            adapter.close()
+
 
 # =============================================================================
 # Lookup and Lock Interface Tests
@@ -663,6 +736,27 @@ class TestLoadInterface:
 
     def test_query_unknown_task_returns_none(self, adapter):
         assert adapter.query_load_result(99999) is None
+
+    def test_load_keeps_memory_object_alive_until_native_completion(self):
+        client = DeferredNativeConnector()
+        adapter = NativeConnectorL2Adapter(client)
+        try:
+            obj = create_memory_obj()
+            obj_ref = weakref.ref(obj)
+            task_id = adapter.submit_load_task([create_object_key(1)], [obj])
+
+            del obj
+            gc.collect()
+            assert obj_ref() is not None
+
+            client.complete_pending()
+            assert wait_for_event_fd(adapter.get_load_event_fd(), timeout=5.0)
+            bitmap = adapter.query_load_result(task_id)
+            assert bitmap is not None
+            gc.collect()
+            assert obj_ref() is None
+        finally:
+            adapter.close()
 
 
 # =============================================================================
@@ -1250,6 +1344,89 @@ class TestDeleteBackwardCompatibility:
             adp.delete([key])  # should not raise, just no-op
         finally:
             adp.close()
+
+
+class TestEvaluationStatus:
+    def test_lookup_and_delete_misses_are_not_native_failures(self, adapter):
+        key = create_object_key(90)
+
+        task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
+        bitmap = adapter.query_lookup_and_lock_result(task_id)
+        assert bitmap is not None
+        assert bitmap.test(0) is False
+        adapter.delete([key])
+
+        status = adapter.report_status()["native_operations"]
+        assert status["lookup"] == {
+            "submitted_keys_total": 1,
+            "succeeded_keys_total": 1,
+            "failed_keys_total": 0,
+        }
+        assert status["delete"] == {
+            "submitted_keys_total": 1,
+            "succeeded_keys_total": 1,
+            "failed_keys_total": 0,
+        }
+
+    def test_status_tracks_store_delete_and_residency(self, adapter_with_capacity):
+        adapter = adapter_with_capacity
+        key = create_object_key(91)
+        obj = create_memory_obj(size=100, fill_value=1.0)
+
+        initial = adapter.report_status()
+        assert initial["pending_native_ops_total"] == 0
+        assert initial["resident_object_count"] == 0
+        assert initial["max_capacity_bytes"] == 2000
+
+        adapter.submit_store_task([key], [obj])
+        assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+        adapter.pop_completed_store_tasks()
+
+        stored = adapter.report_status()
+        assert stored["pending_native_ops_total"] == 0
+        assert stored["resident_object_count"] == 1
+        assert stored["live_bytes"] == 400
+        assert stored["native_operations"]["store"] == {
+            "submitted_keys_total": 1,
+            "succeeded_keys_total": 1,
+            "failed_keys_total": 0,
+        }
+
+        adapter.delete([key])
+
+        deleted = adapter.report_status()
+        assert deleted["pending_native_ops_total"] == 0
+        assert deleted["resident_object_count"] == 0
+        assert deleted["live_bytes"] == 0
+        assert deleted["native_operations"]["delete"] == {
+            "submitted_keys_total": 1,
+            "succeeded_keys_total": 1,
+            "failed_keys_total": 0,
+        }
+
+    def test_delete_completion_failure_is_not_silent(self):
+        class FailingDeleteConnector(MockNativeConnector):
+            def submit_batch_delete(self, keys: list[str]) -> int:
+                with self._lock:
+                    future_id = self._next_id
+                    self._next_id += 1
+                self._push_completion(
+                    future_id,
+                    False,
+                    "injected delete failure",
+                    [False] * len(keys),
+                )
+                return future_id
+
+        adapter = NativeConnectorL2Adapter(FailingDeleteConnector())
+        try:
+            with pytest.raises(RuntimeError, match="injected delete failure"):
+                adapter.delete([create_object_key(92)])
+            status = adapter.report_status()
+            assert status["native_operations"]["delete"]["failed_keys_total"] == 1
+        finally:
+            adapter.close()
 
 
 # =============================================================================

@@ -5,7 +5,8 @@
 Usage::
 
     driver = StorageReplayDriver(sm_config, trace_path)
-    result = driver.run()
+    result = driver.run(replay_cache_salt_suffix="round-0001")
+    result = driver.run(replay_cache_salt_suffix="round-0002")
     driver.close()
 
 The driver:
@@ -39,7 +40,7 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 import hashlib
 import json
 import math
@@ -67,6 +68,7 @@ from lmcache.v1.mp_observability.trace.recorder import safe_storage_config_dict
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.mp_observability.event_bus import EventBus
+    from lmcache.v1.mp_observability.trace.format import Record
 
 logger = init_logger(__name__)
 
@@ -103,6 +105,20 @@ def _rewrite_replay_args(args: dict[str, Any], suffix: str) -> dict[str, Any]:
         key: _rewrite_object_key_cache_salts(value, suffix)
         for key, value in args.items()
     }
+
+
+def _validate_cache_salt_suffix(value: object) -> str:
+    """Validate one constructor- or round-scoped replay salt suffix."""
+    if not isinstance(value, str):
+        raise ValueError("replay_cache_salt_suffix must be a string")
+    if value:
+        ObjectKey(
+            chunk_hash=b"",
+            model_name="replay-validation",
+            kv_rank=0,
+            cache_salt=value,
+        )
+    return value
 
 
 #: Default :class:`ObservabilityConfig` for replay sessions.
@@ -167,6 +183,7 @@ class StorageReplayDriver:
         time_scale: float = 1.0,
         replay_cache_salt_suffix: str = "",
         store_drain_timeout_seconds: float = 60.0,
+        prefetch_completion_timeout_seconds: float = 60.0,
         write_reservation_timeout_seconds: float = 0.0,
     ) -> None:
         """Construct a driver.
@@ -208,6 +225,8 @@ class StorageReplayDriver:
                 to every decoded ``ObjectKey.cache_salt`` before dispatch.
             store_drain_timeout_seconds: Maximum time to wait for queued and
                 in-flight L2 stores after the last trace record.
+            prefetch_completion_timeout_seconds: Maximum time to wait for
+                queued and in-flight prefetch work after the last trace record.
             write_reservation_timeout_seconds: Maximum time to retry
                 best-effort ``reserve_write`` misses. Zero preserves the
                 historical one-shot behavior.
@@ -218,15 +237,7 @@ class StorageReplayDriver:
             raise ValueError("time_scale must be finite and positive") from exc
         if not math.isfinite(parsed_time_scale) or parsed_time_scale <= 0:
             raise ValueError("time_scale must be finite and positive")
-        if not isinstance(replay_cache_salt_suffix, str):
-            raise ValueError("replay_cache_salt_suffix must be a string")
-        if replay_cache_salt_suffix:
-            ObjectKey(
-                chunk_hash=b"",
-                model_name="replay-validation",
-                kv_rank=0,
-                cache_salt=replay_cache_salt_suffix,
-            )
+        parsed_cache_salt_suffix = _validate_cache_salt_suffix(replay_cache_salt_suffix)
         try:
             parsed_store_drain_timeout = float(store_drain_timeout_seconds)
         except (TypeError, ValueError) as exc:
@@ -238,6 +249,21 @@ class StorageReplayDriver:
             or parsed_store_drain_timeout <= 0
         ):
             raise ValueError("store_drain_timeout_seconds must be finite and positive")
+        try:
+            parsed_prefetch_completion_timeout = float(
+                prefetch_completion_timeout_seconds
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "prefetch_completion_timeout_seconds must be finite and positive"
+            ) from exc
+        if (
+            not math.isfinite(parsed_prefetch_completion_timeout)
+            or parsed_prefetch_completion_timeout <= 0
+        ):
+            raise ValueError(
+                "prefetch_completion_timeout_seconds must be finite and positive"
+            )
         try:
             parsed_write_reservation_timeout = float(write_reservation_timeout_seconds)
         except (TypeError, ValueError) as exc:
@@ -256,8 +282,9 @@ class StorageReplayDriver:
         self._trace_path = trace_path
         self._dispatcher = dispatcher or build_default_dispatcher()
         self._time_scale = parsed_time_scale
-        self._replay_cache_salt_suffix = replay_cache_salt_suffix
+        self._replay_cache_salt_suffix = parsed_cache_salt_suffix
         self._store_drain_timeout_seconds = parsed_store_drain_timeout
+        self._prefetch_completion_timeout_seconds = parsed_prefetch_completion_timeout
         self._write_reservation_timeout_seconds = parsed_write_reservation_timeout
         self._closed = False
 
@@ -267,10 +294,10 @@ class StorageReplayDriver:
         # never runs (the caller never got a valid instance), and the
         # reader / bus would leak — see Cursor bugbot comment on
         # PR #3075.
-        reader: TraceReader | None = None
         bus: EventBus | None = None
         try:
-            reader = TraceReader(trace_path)
+            with TraceReader(trace_path) as reader:
+                self._header = reader.header
             bus = init_observability(obs_config)
             self._sm = StorageManager(sm_config)
         except BaseException:
@@ -285,17 +312,8 @@ class StorageReplayDriver:
                         "trace replay: error stopping bus during failed driver init",
                         exc_info=True,
                     )
-            if reader is not None:
-                try:
-                    reader.close()
-                except Exception:
-                    logger.warning(
-                        "trace replay: error closing reader during failed driver init",
-                        exc_info=True,
-                    )
             raise
 
-        self._reader = reader
         self._bus = bus
 
     def __enter__(self) -> StorageReplayDriver:
@@ -342,6 +360,42 @@ class StorageReplayDriver:
                 )
             time.sleep(0.01)
 
+    def _wait_for_prefetch_completion(self) -> None:
+        """Wait until replay-triggered prefetch work has become idle.
+
+        Completed result entries are intentionally excluded: trace replay
+        records submission but may not record a matching result query, so
+        completed results can remain available without representing active
+        I/O. Two consecutive idle observations close a short status-sampling
+        race at a global round boundary.
+        """
+        deadline = time.monotonic() + self._prefetch_completion_timeout_seconds
+        consecutive_idle_polls = 0
+        last_status: dict[str, Any] = {}
+        active_fields = (
+            "submission_queue_size",
+            "pending_queue_size",
+            "in_flight_request_count",
+            "lookup_phase_count",
+            "load_phase_count",
+        )
+        while True:
+            status = self._sm.report_status()
+            last_status = status["prefetch_controller"]
+            active = sum(int(last_status.get(field, 0)) for field in active_fields)
+            if active == 0:
+                consecutive_idle_polls += 1
+                if consecutive_idle_polls >= 2:
+                    return
+            else:
+                consecutive_idle_polls = 0
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "trace replay timed out waiting for prefetch completion: "
+                    f"{last_status}"
+                )
+            time.sleep(0.01)
+
     @staticmethod
     def _only_admission_rejections(status: dict[str, Any]) -> bool:
         """Allow failed store completions only when reject counters explain them."""
@@ -378,7 +432,7 @@ class StorageReplayDriver:
         return self._sm
 
     def close(self) -> None:
-        """Close the StorageManager, stop the bus, and close the reader.
+        """Close the StorageManager and stop the observability bus.
 
         Idempotent.  The order matters: the StorageManager may
         publish teardown events, so the bus outlives it briefly.
@@ -389,16 +443,14 @@ class StorageReplayDriver:
         try:
             self._sm.close()
         finally:
-            try:
-                self._bus.stop()
-            finally:
-                self._reader.close()
+            self._bus.stop()
 
     # ------------------------------------------------------------------
 
     def run(
         self,
         on_record: RecordCallback | None = None,
+        replay_cache_salt_suffix: str | None = None,
     ) -> ReplayResult:
         """Replay every record in the trace.
 
@@ -414,23 +466,40 @@ class StorageReplayDriver:
             on_record: Optional per-record callback invoked after
                 dispatch with ``(qualname, latency_s, failed)``.
                 Used by the CLI's ``--jsonl-out`` feature.
+            replay_cache_salt_suffix: Optional suffix for this round. ``None``
+                uses the constructor default; a string, including ``""``,
+                overrides it without rebuilding the StorageManager.
 
         Returns:
             A :class:`ReplayResult` summarizing the run.
         """
+        if self._closed:
+            raise RuntimeError("StorageReplayDriver is closed")
+        suffix = (
+            self._replay_cache_salt_suffix
+            if replay_cache_salt_suffix is None
+            else _validate_cache_salt_suffix(replay_cache_salt_suffix)
+        )
         stats = ReplayStatsCollector()
         context = ReplayContext(
             sm=self._sm,
             write_reservation_timeout_seconds=(self._write_reservation_timeout_seconds),
+            prefetch_completion_timeout_seconds=(
+                self._prefetch_completion_timeout_seconds
+            ),
         )
-        header = self._reader.header
+        header = self._header
         t_start = time.time()
         stats.mark_start(t_start)
 
         replayed = skipped = failed = 0
         t_wall_origin = time.monotonic()
 
-        for record in self._reader.records():
+        def _records() -> Iterator[Record]:
+            with TraceReader(self._trace_path) as reader:
+                yield from reader.records()
+
+        for record in _records():
             # Sleep just long enough to align to the recorded
             # offset from the start of replay.  No speedup — if
             # the replay machine is slower than recording, the
@@ -444,7 +513,7 @@ class StorageReplayDriver:
                 decoded_args = codecs.decode_args(record.args)
                 decoded_args = _rewrite_replay_args(
                     decoded_args,
-                    self._replay_cache_salt_suffix,
+                    suffix,
                 )
             except Exception:
                 skipped += 1
@@ -508,6 +577,7 @@ class StorageReplayDriver:
             context.open_read_contexts.pop(key_tuple, None)
 
         self._wait_for_store_drain()
+        self._wait_for_prefetch_completion()
 
         stats.mark_end(time.time())
 

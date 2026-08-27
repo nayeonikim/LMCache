@@ -400,6 +400,13 @@ No per-op schemas live on either side.  Decoded arg names feed
 straight into `**kwargs`, matching the signature the recorder bound
 with `inspect.signature` at decoration time.
 
+One compatibility exception is retained for schema-v1 traces that recorded
+`submit_prefetch_task(keys=..., layout_desc=..., extra_count=...)` before the
+API moved to `PrefetchRequestSpec`.  The dispatcher upgrades those arguments
+to a group-0 spec, waits for completion, consumes the result, and releases
+retained LOOKUP read locks.  Traces that already contain `spec` are forwarded
+unchanged, including their caller-recorded completion lifecycle.
+
 ### 9.3 Dispatcher & context
 
 `CallDispatcher` is a simple `qualname → Handler` map with
@@ -409,6 +416,8 @@ with `inspect.signature` at decoration time.
 - `open_read_contexts: dict[tuple[ObjectKey, ...], deque[CM]]` — a
   FIFO per key tuple so overlapping `read_prefetched_results`
   contexts entered and exited via the trace pair up correctly.
+- The legacy-prefetch completion timeout used only by the schema-v1
+  compatibility path described above.
 
 Unmatched `__exit__` records (typically from a truncated tail) log a
 warning and are ignored; the driver's final sweep calls `__exit__`

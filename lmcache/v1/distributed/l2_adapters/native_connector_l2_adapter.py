@@ -130,6 +130,12 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             tuple[str, L2TaskId, int, list[ObjectKey] | None],
         ] = {}
 
+        # Keep each MemoryObj (and therefore its raw buffer) alive until the
+        # native connector reports completion. The pybind boundary passes raw
+        # pointers to asynchronous C++ workers and does not retain Python
+        # buffer owners on their behalf.
+        self._pending_io_objects: dict[int, tuple[MemoryObj, ...]] = {}
+
         # Completed results (same pattern as MockL2Adapter)
         self._completed_stores: dict[L2TaskId, L2StoreResult] = {}
         self._completed_lookups: dict[L2TaskId, Bitmap] = {}
@@ -143,6 +149,25 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         # Pending delete events for synchronous delete() calls
         self._pending_delete_events: dict[L2TaskId, threading.Event] = {}
+        self._completed_deletes: dict[L2TaskId, tuple[bool, str]] = {}
+
+        # Cumulative native operation outcomes. These counters are updated
+        # under ``_lock`` and let evaluation callers distinguish a quiet,
+        # successful adapter from one that merely has no pending requests.
+        self._operation_stats: dict[str, dict[str, int]] = {
+            op_type: {
+                "submitted_keys_total": 0,
+                "succeeded_keys_total": 0,
+                "failed_keys_total": 0,
+            }
+            for op_type in (
+                self._OP_STORE,
+                self._OP_LOOKUP,
+                self._OP_LOAD,
+                self._OP_DELETE,
+            )
+        }
+        self._last_native_errors: dict[str, str] = {}
 
         # Per-key size tracking. ``_key_sizes`` lets us look up byte sizes
         # at delete time (the native completion only carries booleans, not
@@ -207,7 +232,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 len(keys),
                 None,
             )
+            self._pending_io_objects[future_id] = tuple(objects)
             self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
+            self._operation_stats[self._OP_STORE]["submitted_keys_total"] += len(keys)
 
         return task_id
 
@@ -239,6 +266,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 len(keys),
                 list(keys),
             )
+            self._operation_stats[self._OP_LOOKUP]["submitted_keys_total"] += len(keys)
 
         return task_id
 
@@ -277,6 +305,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 len(keys),
                 list(keys),
             )
+            self._pending_io_objects[future_id] = tuple(objects)
+            self._operation_stats[self._OP_LOAD]["submitted_keys_total"] += len(keys)
 
         return task_id
 
@@ -297,7 +327,15 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         tracking stays in sync.
 
         No-op if the connector does not expose ``submit_batch_delete``
-        or if the key list is empty.
+        or if the key list is empty. A per-key miss remains an idempotent
+        successful call, but a failed native batch is surfaced to the caller.
+
+        Args:
+            keys: Object keys to delete from the native backend.
+
+        Raises:
+            RuntimeError: If the native connector reports batch failure.
+            TimeoutError: If no native completion arrives within 30 seconds.
         """
         if not keys or not self._has_delete:
             return
@@ -315,22 +353,33 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 list(keys),
             )
             self._pending_delete_events[task_id] = done_event
+            self._operation_stats[self._OP_DELETE]["submitted_keys_total"] += len(keys)
 
         # Block until demux thread signals completion
         if not done_event.wait(timeout=30.0):
             with self._lock:
                 self._pending_delete_events.pop(task_id, None)
+                self._completed_deletes.pop(task_id, None)
                 # Note: _pending_ops entry may already be consumed
                 # by the demux thread; pop is safe either way.
+                removed_pending_op = False
                 for fid, entry in list(self._pending_ops.items()):
                     if entry[1] == task_id:
                         self._pending_ops.pop(fid, None)
+                        removed_pending_op = True
                         break
-            logger.warning(
-                "delete() timed out after 30s for %d keys",
-                len(keys),
+                if removed_pending_op:
+                    self._record_operation_result(self._OP_DELETE, 0, len(keys))
+            raise TimeoutError(f"delete() timed out after 30s for {len(keys)} keys")
+
+        with self._lock:
+            ok, error = self._completed_deletes.pop(
+                task_id,
+                (False, "native delete completion result is missing"),
             )
-            return
+        if not ok:
+            detail = error or "native connector reported delete failure"
+            raise RuntimeError(detail)
 
         # ``_notify_keys_deleted`` is fired by the demux thread (with
         # accurate per-key sizes drawn from ``_key_sizes``) when the
@@ -349,17 +398,48 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         """Return a status dict for this native-connector L2 adapter.
 
         Returns:
-            A dict with at minimum:
+            A dict with:
               * ``is_healthy`` (bool): ``True`` while the background demux
                 thread is alive and not stopping.
               * ``type`` (str): Stable adapter type label, supplied by the
                 factory or derived from the native client class name.
+              * ``pending_native_ops_total`` (int): Number of submitted native
+                operations that have not completed.
+              * ``pending_native_ops`` (dict[str, int]): Pending operation
+                count grouped by operation type.
+              * ``resident_object_count`` (int): Number of objects accounted
+                as resident after successful native stores and deletes.
+              * ``live_bytes`` (int): Accounted resident bytes.
+              * ``max_capacity_bytes`` (int): Configured adapter capacity used
+                by the L2 eviction and evaluation occupancy gates.
+              * ``native_operations`` (dict[str, dict[str, int]]): Cumulative
+                submitted, succeeded, and failed key totals per operation.
+              * ``last_native_errors`` (dict[str, str]): Most recent native
+                completion error for each operation type that has failed.
             Plus any caller-supplied ``extra_status`` fields (e.g. backend
             configuration like ``base_path``, ``num_workers``).
         """
+        with self._lock:
+            pending_by_operation = {op_type: 0 for op_type in self._operation_stats}
+            for op_type, _task_id, _num_keys, _keys in self._pending_ops.values():
+                pending_by_operation[op_type] += 1
+            operation_stats = {
+                op_type: dict(stats) for op_type, stats in self._operation_stats.items()
+            }
+            last_native_errors = dict(self._last_native_errors)
+            resident_object_count = len(self._key_sizes)
+
+        usage = self.get_usage()
         status: dict[str, Any] = {
             "is_healthy": (self._demux_thread.is_alive() and not self._stop.is_set()),
             "type": self._type_name,
+            "pending_native_ops_total": sum(pending_by_operation.values()),
+            "pending_native_ops": pending_by_operation,
+            "resident_object_count": resident_object_count,
+            "live_bytes": usage.total_bytes_used,
+            "max_capacity_bytes": usage.total_capacity_bytes,
+            "native_operations": operation_stats,
+            "last_native_errors": last_native_errors,
         }
         status.update(self._extra_status)
         return status
@@ -373,6 +453,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self._demux_thread.join(timeout=5)
 
         self._client.close()
+        with self._lock:
+            self._pending_io_objects.clear()
 
         self._store_efd.close()
         self._lookup_efd.close()
@@ -435,6 +517,11 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 ) in completions:
                     fid = int(future_id)
                     entry = self._pending_ops.pop(fid, None)
+                    # Native I/O has completed, so its Python buffer owners can
+                    # now be released. Do not bind the popped tuple locally:
+                    # a demux-loop local would extend its lifetime until the
+                    # next completion batch.
+                    self._pending_io_objects.pop(fid, None)
                     if entry is None:
                         logger.warning(
                             "Received completion for unknown future_id=%d",
@@ -448,6 +535,19 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         num_keys,
                         lookup_keys,
                     ) = entry
+
+                    if not ok:
+                        native_error = (
+                            error or "native operation failed without error detail"
+                        )
+                        self._last_native_errors[op_type] = native_error
+                        logger.warning(
+                            "Native %s task %d failed for %d keys: %s",
+                            op_type,
+                            task_id,
+                            num_keys,
+                            native_error,
+                        )
 
                     if op_type == self._OP_STORE:
                         store_info = self._pending_store_sizes.pop(fid, None)
@@ -471,6 +571,13 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                     keys_stored.append(key)
                                     sizes_stored.append(0)
                         self._completed_stores[task_id] = L2StoreResult(ok, task_bytes)
+                        # A failed store batch accounts every submitted key as failed.
+                        succeeded_keys = num_keys if ok else 0
+                        self._record_operation_result(
+                            op_type,
+                            succeeded_keys,
+                            num_keys - succeeded_keys,
+                        )
                         self._store_efd.notify()
 
                     elif op_type == self._OP_LOOKUP:
@@ -482,12 +589,19 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                     if lookup_keys is not None:
                                         self._locked_keys[lookup_keys[i]] += 1
                         self._completed_lookups[task_id] = bitmap
+                        # Per-key load misses do not make a successful batch fail.
+                        succeeded_keys = num_keys if ok else 0
+                        self._record_operation_result(
+                            op_type,
+                            succeeded_keys,
+                            num_keys - succeeded_keys,
+                        )
                         self._lookup_efd.notify()
 
                     elif op_type == self._OP_LOAD:
                         bitmap = Bitmap(num_keys)
                         loaded_keys: list[ObjectKey] = []
-                        if result_bools is not None:
+                        if ok and result_bools is not None:
                             for i, loaded in enumerate(result_bools):
                                 if loaded:
                                     bitmap.set(i)
@@ -502,11 +616,22 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                 loaded_keys.extend(lookup_keys)
                         keys_accessed.extend(loaded_keys)
                         self._completed_loads[task_id] = bitmap
+                        succeeded_keys = num_keys if ok else 0
+                        self._record_operation_result(
+                            op_type,
+                            succeeded_keys,
+                            num_keys - succeeded_keys,
+                        )
                         self._load_efd.notify()
 
                     elif op_type == self._OP_DELETE:
-                        if result_bools is not None and lookup_keys is not None:
-                            for i, deleted in enumerate(result_bools):
+                        if ok and lookup_keys is not None:
+                            delete_results = (
+                                result_bools
+                                if result_bools is not None
+                                else [True] * num_keys
+                            )
+                            for i, deleted in enumerate(delete_results):
                                 if not deleted:
                                     continue
                                 key = lookup_keys[i]
@@ -515,6 +640,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                 if key in self._key_sizes:
                                     sizes_deleted.append(self._key_sizes.pop(key))
                                     keys_deleted.append(key)
+                        # Delete misses are idempotent successes for callers.
+                        operation_succeeded_keys = num_keys if ok else 0
+                        self._record_operation_result(
+                            op_type,
+                            operation_succeeded_keys,
+                            num_keys - operation_succeeded_keys,
+                        )
+                        self._completed_deletes[task_id] = (ok, error or "")
                         evt = self._pending_delete_events.pop(task_id, None)
                         if evt is not None:
                             delete_done_events.append(evt)
@@ -534,3 +667,13 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             # returning and the notify running.
             for evt in delete_done_events:
                 evt.set()
+
+    def _record_operation_result(
+        self,
+        op_type: str,
+        succeeded_keys: int,
+        failed_keys: int,
+    ) -> None:
+        """Record key-level outcomes while ``_lock`` is held."""
+        self._operation_stats[op_type]["succeeded_keys_total"] += succeeded_keys
+        self._operation_stats[op_type]["failed_keys_total"] += failed_keys

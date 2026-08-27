@@ -79,6 +79,7 @@ class StoreListener(L1ManagerListener):
 
     def __init__(self) -> None:
         self._pending_keys: list[ObjectKey] = []
+        self._processing_keys_count = 0
         self._lock = threading.Lock()
         self._event_fd = create_event_notifier()
 
@@ -109,12 +110,42 @@ class StoreListener(L1ManagerListener):
         with self._lock:
             keys = self._pending_keys
             self._pending_keys = []
+            self._processing_keys_count += len(keys)
         return keys
 
     def pending_count(self) -> int:
         """Return the number of pending keys waiting to be processed."""
         with self._lock:
             return len(self._pending_keys)
+
+    def processing_count(self) -> int:
+        """Return the number of popped keys still being processed.
+
+        Returns:
+            Number of keys transferred from the pending queue to the store
+            controller but not yet marked as processed.
+        """
+        with self._lock:
+            return self._processing_keys_count
+
+    def mark_processed(self, key_count: int) -> None:
+        """Mark previously popped keys as processed by the controller.
+
+        Args:
+            key_count: Number of keys whose routing and submission processing
+                has finished.
+
+        Raises:
+            ValueError: If ``key_count`` is negative or exceeds the number of
+                keys currently marked as processing.
+        """
+        with self._lock:
+            if key_count < 0 or key_count > self._processing_keys_count:
+                raise ValueError(
+                    "processed key count must be between zero and the "
+                    "current processing key count"
+                )
+            self._processing_keys_count -= key_count
 
     # L1ManagerListener implementation
 
@@ -260,7 +291,14 @@ class StoreController(StorageControllerInterface):
         self._in_flight_tasks: dict[tuple[int, L2TaskId], InFlightStoreTask] = {}
 
         # Shadow counter for status reporting (updated in background loop)
+        self._status_lock = threading.Lock()
         self._status_in_flight_count: int = 0
+        self._submitted_task_count = 0
+        self._submitted_key_count = 0
+        self._successful_task_count = 0
+        self._successful_key_count = 0
+        self._failed_task_count = 0
+        self._failed_key_count = 0
 
         StoreController._gauge_target = self
         if not StoreController._gauge_registered:
@@ -320,15 +358,33 @@ class StoreController(StorageControllerInterface):
         self._listener.close()
         self._adapter_ctrl_efd.close()
 
-    def report_status(self) -> dict:
-        """Return a status dict for the store controller."""
+    def report_status(self) -> dict[str, object]:
+        """Return queue, in-flight, and cumulative L2 store status.
+
+        Returns:
+            A dictionary containing controller health, queue depth, adapter
+            counts, and cumulative submitted/successful/failed task and key
+            totals. ``processing_keys_count`` closes the observation gap
+            between draining the listener queue and submitting L2 tasks.
+        """
         is_healthy = self._thread.is_alive()
         num_draining = len(self._draining)
+        with self._status_lock:
+            status_counters = {
+                "in_flight_task_count": self._status_in_flight_count,
+                "submitted_task_count": self._submitted_task_count,
+                "submitted_key_count": self._submitted_key_count,
+                "successful_task_count": self._successful_task_count,
+                "successful_key_count": self._successful_key_count,
+                "failed_task_count": self._failed_task_count,
+                "failed_key_count": self._failed_key_count,
+            }
         return {
             "is_healthy": is_healthy,
             "thread_alive": is_healthy,
             "pending_keys_count": self._listener.pending_count(),
-            "in_flight_task_count": self._status_in_flight_count,
+            "processing_keys_count": self._listener.processing_count(),
+            **status_counters,
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - num_draining,
             "num_draining_adapters": num_draining,
@@ -468,7 +524,10 @@ class StoreController(StorageControllerInterface):
                     if fd == listener_efd:
                         keys = self._listener.pop_pending_keys()
                         if keys:
-                            self._process_new_keys(keys)
+                            try:
+                                self._process_new_keys(keys)
+                            finally:
+                                self._listener.mark_processed(len(keys))
                     else:
                         adapter_idx = self._efd_to_adapter_index.get(fd)
                         if adapter_idx is not None:
@@ -660,7 +719,10 @@ class StoreController(StorageControllerInterface):
                 keys=successful_keys,
                 read_locked_keys=list(successful_keys),
             )
-            self._status_in_flight_count += 1
+            with self._status_lock:
+                self._status_in_flight_count += 1
+                self._submitted_task_count += 1
+                self._submitted_key_count += len(successful_keys)
 
             # All objects for a single store task share one layout (L1
             # allocates uniform MemoryObjs per chunk), so total bytes is
@@ -732,7 +794,14 @@ class StoreController(StorageControllerInterface):
 
         l1_mgr.finish_read(task.read_locked_keys)
         del self._in_flight_tasks[task_key]
-        self._status_in_flight_count -= 1
+        with self._status_lock:
+            self._status_in_flight_count -= 1
+            if success:
+                self._successful_task_count += 1
+                self._successful_key_count += len(task.keys)
+            else:
+                self._failed_task_count += 1
+                self._failed_key_count += len(task.keys)
 
         l2_name = self._adapter_descriptors[adapter_index].type_name
         completion_meta: dict[str, object] = {
@@ -794,4 +863,8 @@ class StoreController(StorageControllerInterface):
                 len(task.read_locked_keys),
             )
             l1_mgr.finish_read(task.read_locked_keys)
+            with self._status_lock:
+                self._status_in_flight_count -= 1
+                self._failed_task_count += 1
+                self._failed_key_count += len(task.keys)
         self._in_flight_tasks.clear()

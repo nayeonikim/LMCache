@@ -24,10 +24,16 @@ from typing import Any, Callable
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import (
+    ObjectKey,
+    PrefetchMode,
+    PrefetchRequestSpec,
+)
 from lmcache.v1.distributed.storage_manager import StorageManager
 
 logger = init_logger(__name__)
+
+_ZERO_FILL_CHUNK = bytes(1 << 20)
 
 #: Fully-qualified name of the ``StorageManager`` class.  Used to
 #: build the qualnames of all its traced methods.  Kept as a constant
@@ -56,6 +62,9 @@ class ReplayContext:
         write_reservation_timeout_seconds: Maximum time to retry keys that
             ``reserve_write`` could not reserve. Zero preserves the legacy
             best-effort single-call behavior.
+        prefetch_completion_timeout_seconds: Maximum time to complete and
+            consume a legacy submit-only prefetch. Zero preserves submit-only
+            replay for callers that construct the context directly.
     """
 
     sm: StorageManager
@@ -63,6 +72,7 @@ class ReplayContext:
         field(default_factory=dict)
     )
     write_reservation_timeout_seconds: float = 0.0
+    prefetch_completion_timeout_seconds: float = 0.0
 
 
 #: Type of a dispatcher handler: takes a :class:`ReplayContext` and an
@@ -71,6 +81,22 @@ class ReplayContext:
 #: :mod:`lmcache.v1.mp_observability.trace.codecs`).  Handlers return
 #: nothing; any return value from the live call is discarded.
 Handler = Callable[[ReplayContext, dict[str, Any]], None]
+
+
+def _materialize_reserved_objects(reserved: dict[ObjectKey, Any]) -> None:
+    """Back replay writes with resident zero-filled user pages.
+
+    Storage traces intentionally omit KV payload bytes. The replay contract
+    substitutes zeros, which also mirrors the caller-side buffer write that
+    occurred between ``reserve_write`` and ``finish_write`` in the recorded
+    workload. Filling in bounded chunks avoids allocating one temporary bytes
+    object as large as each KV object.
+    """
+    for obj in reserved.values():
+        view = memoryview(obj.byte_array).cast("B")
+        for offset in range(0, view.nbytes, len(_ZERO_FILL_CHUNK)):
+            end = min(offset + len(_ZERO_FILL_CHUNK), view.nbytes)
+            view[offset:end] = _ZERO_FILL_CHUNK[: end - offset]
 
 
 class CallDispatcher:
@@ -189,6 +215,7 @@ def _reserve_write(ctx: ReplayContext, args: dict[str, Any]) -> None:
         call_args = dict(args)
         call_args["keys"] = pending_keys
         reserved = ctx.sm.reserve_write(**call_args)
+        _materialize_reserved_objects(reserved)
         if ctx.write_reservation_timeout_seconds == 0:
             return
 
@@ -207,6 +234,63 @@ def _reserve_write(ctx: ReplayContext, args: dict[str, Any]) -> None:
                 f"storage_status={storage_status}"
             )
         time.sleep(0.01)
+
+
+def _submit_prefetch_task(ctx: ReplayContext, args: dict[str, Any]) -> None:
+    """Replay current or schema-v1 prefetch arguments against the live API.
+
+    Current traces already carry a ``PrefetchRequestSpec`` and are forwarded
+    without changing their caller lifecycle. Schema-v1 evaluation traces carry
+    ``keys`` and one ``layout_desc`` instead. Those traces are submit-only, so
+    the compatibility path upgrades their arguments, waits for completion,
+    consumes the result, and releases retained LOOKUP read locks before replay
+    continues.
+
+    Args:
+        ctx: Active replay context containing the completion timeout policy.
+        args: Decoded ``StorageManager.submit_prefetch_task`` arguments from
+            either the current schema or the schema-v1 evaluation traces.
+
+    Raises:
+        TimeoutError: If a legacy prefetch does not complete before the timeout.
+        RuntimeError: If a completed legacy prefetch result cannot be consumed.
+    """
+    if "spec" in args:
+        ctx.sm.submit_prefetch_task(**args)
+        return
+
+    legacy_args = dict(args)
+    keys = legacy_args.pop("keys")
+    layout_desc = legacy_args.pop("layout_desc")
+    extra_count = int(legacy_args.pop("extra_count", 0))
+    mode = legacy_args.pop("mode", PrefetchMode.LOOKUP)
+    spec = PrefetchRequestSpec(
+        keys=keys,
+        group_layout_descs={0: layout_desc},
+        extra_count=extra_count,
+        mode=mode,
+    )
+    handle = ctx.sm.submit_prefetch_task(spec=spec, **legacy_args)
+
+    timeout = ctx.prefetch_completion_timeout_seconds
+    if timeout == 0:
+        return
+    if not ctx.sm.wait_prefetch_status(handle, timeout):
+        raise TimeoutError(
+            f"trace replay timed out waiting for prefetch completion after {timeout:g}s"
+        )
+    retained = ctx.sm.query_prefetch_status(handle)
+    if retained is None:
+        raise RuntimeError("trace replay could not consume completed prefetch result")
+    if spec.mode is not PrefetchMode.LOOKUP:
+        return
+
+    retained_keys = retained.gather(spec.keys)
+    if retained_keys:
+        ctx.sm.finish_read_prefetched(
+            keys=retained_keys,
+            extra_count=spec.extra_count,
+        )
 
 
 def _enter_read_prefetched(ctx: ReplayContext, args: dict[str, Any]) -> None:
@@ -280,9 +364,12 @@ def build_default_dispatcher() -> CallDispatcher:
         f"{_SM_PREFIX}.reserve_write",
         _reserve_write,
     )
+    dispatcher.register(
+        f"{_SM_PREFIX}.submit_prefetch_task",
+        _submit_prefetch_task,
+    )
     for method_name in (
         "finish_write",
-        "submit_prefetch_task",
         "finish_read_prefetched",
     ):
         dispatcher.register(

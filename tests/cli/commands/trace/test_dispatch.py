@@ -17,7 +17,7 @@ from lmcache.cli.commands.trace._dispatch import (
     ReplayContext,
     build_default_dispatcher,
 )
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import ObjectKey, PrefetchRequestSpec
 
 _SM_PREFIX = "lmcache.v1.distributed.storage_manager.StorageManager"
 
@@ -86,7 +86,26 @@ class _SequencedReserveSM(_FakeSM):
     def reserve_write(self, **kw: Any) -> dict[ObjectKey, object]:
         self.calls.append(("reserve_write", kw))
         accepted = next(self._responses, set())
-        return {key: object() for key in kw["keys"] if key in accepted}
+        return {_key: _FakeMemoryObj() for _key in kw["keys"] if _key in accepted}
+
+
+class _FakeMemoryObj:
+    def __init__(self, size: int = 17) -> None:
+        self.data = bytearray([0xA5] * size)
+
+    @property
+    def byte_array(self) -> memoryview:
+        return memoryview(self.data)
+
+
+class _MaterializingReserveSM(_FakeSM):
+    def __init__(self, keys: list[ObjectKey]) -> None:
+        super().__init__()
+        self.objects = {key: _FakeMemoryObj() for key in keys}
+
+    def reserve_write(self, **kw: Any) -> dict[ObjectKey, _FakeMemoryObj]:
+        self.calls.append(("reserve_write", kw))
+        return {key: self.objects[key] for key in kw["keys"]}
 
 
 class _FakeBitmap:
@@ -215,6 +234,68 @@ class TestDefaultDispatcher:
         )
 
         assert len(sm.calls) == 1
+
+    def test_reserve_write_zero_fills_replay_buffers(self):
+        keys = [_key(1), _key(2)]
+        sm = _MaterializingReserveSM(keys)
+
+        build_default_dispatcher().dispatch(
+            f"{_SM_PREFIX}.reserve_write",
+            ReplayContext(sm=sm),
+            {"keys": keys, "layout_desc": "LAYOUT", "mode": "new"},
+        )
+
+        assert all(not any(obj.data) for obj in sm.objects.values())
+
+    def test_legacy_prefetch_args_are_upgraded_and_completed(self):
+        keys = [_key(1), _key(2)]
+        sm = _FakeSM()
+        ctx = ReplayContext(sm=sm, prefetch_completion_timeout_seconds=5.0)
+
+        build_default_dispatcher().dispatch(
+            f"{_SM_PREFIX}.submit_prefetch_task",
+            ctx,
+            {
+                "keys": keys,
+                "layout_desc": "LAYOUT",
+                "extra_count": 2,
+                "external_request_id": "request-1",
+            },
+        )
+
+        call_name, call_args = sm.calls[0]
+        assert call_name == "submit_prefetch_task"
+        spec = call_args["spec"]
+        assert isinstance(spec, PrefetchRequestSpec)
+        assert spec.keys == keys
+        assert spec.group_layout_descs == {0: "LAYOUT"}
+        assert spec.extra_count == 2
+        assert call_args["external_request_id"] == "request-1"
+        assert sm.calls[1:] == [
+            (
+                "wait_prefetch_status",
+                {"handle": sm.prefetch_handle, "timeout": 5.0},
+            ),
+            ("query_prefetch_status", {"handle": sm.prefetch_handle}),
+            ("finish_read_prefetched", {"keys": [keys[0]], "extra_count": 2}),
+        ]
+
+    def test_legacy_prefetch_completion_timeout_is_dispatch_failure(self):
+        sm = _FakeSM()
+        sm.prefetch_wait_result = False
+        ctx = ReplayContext(sm=sm, prefetch_completion_timeout_seconds=5.0)
+
+        with pytest.raises(TimeoutError, match="prefetch completion"):
+            build_default_dispatcher().dispatch(
+                f"{_SM_PREFIX}.submit_prefetch_task",
+                ctx,
+                {
+                    "keys": [_key(1)],
+                    "layout_desc": "LAYOUT",
+                    "extra_count": 0,
+                    "external_request_id": "request-1",
+                },
+            )
 
     def test_read_prefetched_enter_exit_fifo(self):
         """Two overlapping contexts with identical keys exit in FIFO order."""

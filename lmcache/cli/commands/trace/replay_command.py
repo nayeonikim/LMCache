@@ -113,6 +113,15 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--prefetch-completion-timeout-seconds",
+        type=float,
+        default=60.0,
+        help=(
+            "Wait up to this many seconds for queued and in-flight prefetch "
+            "work after the final record (default: 60)."
+        ),
+    )
+    parser.add_argument(
         "--write-reservation-timeout-seconds",
         type=float,
         default=0.0,
@@ -258,6 +267,9 @@ def run_trace_replay(args: argparse.Namespace) -> None:
             time_scale=args.time_scale,
             replay_cache_salt_suffix=args.replay_cache_salt_suffix,
             store_drain_timeout_seconds=args.store_drain_timeout_seconds,
+            prefetch_completion_timeout_seconds=(
+                args.prefetch_completion_timeout_seconds
+            ),
             write_reservation_timeout_seconds=(args.write_reservation_timeout_seconds),
         ) as driver:
             result = driver.run(on_record=_on_record)

@@ -174,6 +174,16 @@ class TestOverQuotaEviction:
             "bob was within quota — nothing should have moved"
         )
 
+        status = controller.report_status()
+        adapter_status = status["adapters"][0]
+        assert adapter_status["trigger_count"] == 1
+        assert adapter_status["delete_requested_keys_total"] > 0
+        assert (
+            adapter_status["delete_succeeded_keys_total"]
+            == adapter_status["delete_requested_keys_total"]
+        )
+        assert adapter_status["delete_failed_keys_total"] == 0
+
     def test_unregistered_salt_gets_wiped(self, isolated_lru_setup):
         """A salt with no quota entry is fully evicted on the next
         cycle (allowlist semantics)."""

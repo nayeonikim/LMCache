@@ -135,3 +135,31 @@ def test_fs_native_stores_salted_object_group_filename(tmp_path: Path) -> None:
         store_key_and_require_success(adapter, key)
 
     assert (tmp_path / "llama@0x000000ff@5@00010203@alice.data").exists()
+
+
+def test_fs_native_delete_distinguishes_miss_from_filesystem_error(
+    tmp_path: Path,
+) -> None:
+    """A missing key is idempotent but an unlink error reaches the caller."""
+    key = ObjectKey(
+        chunk_hash=b"\x10\x20\x30\x40",
+        model_name="llama",
+        kv_rank=7,
+        object_group_id=2,
+    )
+    missing = ObjectKey(
+        chunk_hash=b"\xff\xee\xdd\xcc",
+        model_name="llama",
+        kv_rank=7,
+        object_group_id=2,
+    )
+
+    with fs_native_adapter(tmp_path) as adapter:
+        store_key_and_require_success(adapter, key)
+        adapter.delete([missing])
+        try:
+            tmp_path.chmod(0o500)
+            with pytest.raises(RuntimeError, match="Permission denied"):
+                adapter.delete([key])
+        finally:
+            tmp_path.chmod(0o700)

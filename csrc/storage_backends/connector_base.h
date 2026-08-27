@@ -340,14 +340,8 @@ class ConnectorBase : public IStorageConnector {
   }
   virtual void do_batch_delete(ConnectionType& conn, const Request& req) {
     for (size_t i = 0; i < req.keys.size(); ++i) {
-      try {
-        bool deleted = do_single_delete(conn, req.keys[i]);
-        req.batch->per_key_results[req.start_idx + i] = deleted ? 1 : 0;
-      } catch (const std::exception& e) {
-        req.batch->per_key_results[req.start_idx + i] = 0;
-        fprintf(stderr, "[LMCache DELETE] key %s failed: %s\n",
-                req.keys[i].c_str(), e.what());
-      }
+      bool deleted = do_single_delete(conn, req.keys[i]);
+      req.batch->per_key_results[req.start_idx + i] = deleted ? 1 : 0;
     }
   }
   virtual void shutdown_connections() {}
