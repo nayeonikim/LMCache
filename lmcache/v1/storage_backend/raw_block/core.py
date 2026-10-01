@@ -1185,6 +1185,30 @@ class RawBlockCore:
         offset = (-ptr) % self.block_align
         return memoryview(backing)[offset : offset + length]
 
+    @staticmethod
+    def _allocation_span_bytes(memory_obj: MemoryObj, ptr: int) -> int:
+        """Return how many bytes from ``ptr`` belong to the object's allocation.
+
+        Args:
+            memory_obj: Memory object whose data starts at ``ptr``.
+            ptr: Start address of the object's data.
+
+        Returns:
+            Bytes addressable from ``ptr`` within both the backing tensor and
+            the object's physical size, or 0 when the backing storage is not a
+            contiguous CPU tensor starting at ``ptr``.
+        """
+        raw_data = getattr(memory_obj, "raw_data", None)
+        if (
+            not isinstance(raw_data, torch.Tensor)
+            or raw_data.device.type != "cpu"
+            or not raw_data.is_contiguous()
+            or raw_data.data_ptr() != ptr
+        ):
+            return 0
+        tensor_bytes = raw_data.numel() * raw_data.element_size()
+        return min(tensor_bytes, int(memory_obj.get_physical_size()))
+
     def _build_direct_odirect_view(
         self,
         memory_obj: MemoryObj,
@@ -1194,20 +1218,32 @@ class RawBlockCore:
         *,
         zero_tail: bool,
     ) -> Optional[memoryview]:
-        """Build an aligned memoryview for direct O_DIRECT I/O when possible.
+        """Build an aligned memoryview for direct block-aligned I/O.
+
+        For O_DIRECT or io_uring_cmd, the view may extend into a contiguous CPU
+        tensor's physical allocation, up to ``total_len``. When ``zero_tail`` is
+        true and the view covers the transfer, padding is zeroed in place without
+        changing the logical payload. The caller must keep the allocation valid
+        until I/O completes.
 
         Args:
             memory_obj: Memory object whose backing allocation may be aligned.
             payload_len: Logical payload length in bytes.
-            total_len: I/O length after any O_DIRECT padding.
-            buffer_len: Available buffer length in bytes.
-            zero_tail: Whether to zero any padded tail bytes before writing.
+            total_len: I/O length after block-alignment padding.
+            buffer_len: Logical buffer length exposed by the caller. The view
+                may extend past it into the object's physical allocation, up to
+                ``total_len``.
+            zero_tail: Whether to zero the padded tail bytes before writing.
 
         Returns:
             A direct memoryview over the allocation, or None when the memory
             object is unsuitable for direct I/O.
         """
-        if not self.use_odirect or not self.enable_zero_copy:
+        if not self._requires_transfer_alignment or not self.enable_zero_copy:
+            return None
+        if not self.use_odirect and buffer_len >= total_len:
+            # io_uring_cmd submits a full-length logical buffer as is; a direct
+            # view only helps when it must reach into the physical allocation.
             return None
 
         ptr_val = getattr(memory_obj, "data_ptr", None)
@@ -1227,7 +1263,10 @@ class RawBlockCore:
         if buffer_len < payload_len:
             return None
 
-        view_len = min(buffer_len, total_len)
+        capacity = buffer_len
+        if capacity < total_len:
+            capacity = max(capacity, self._allocation_span_bytes(memory_obj, ptr))
+        view_len = min(capacity, total_len)
         if view_len < payload_len:
             return None
 
@@ -1280,9 +1319,7 @@ class RawBlockCore:
                     f"Aligned payload {total_len} exceeds slot capacity "
                     f"{payload_capacity}"
                 )
-            # byte_array exposes only payload_len bytes, so a padded payload
-            # reaches the Rust write path shorter than total_len and is bounced
-            # there, which also zeroes [payload_len, total_len).
+            # Use allocation padding without changing the logical payload length.
             direct_view = self._build_direct_odirect_view(
                 memory_obj=memory_obj,
                 payload_len=payload_len,

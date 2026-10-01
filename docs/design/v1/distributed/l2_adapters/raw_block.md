@@ -189,6 +189,17 @@ Important validation rules:
 - with `use_odirect=true`, raw-block I/O rejects offsets and total I/O lengths
   that are not aligned to `block_align`; misaligned write buffers use an
   aligned bounce buffer
+- with `enable_zero_copy=true` and either `use_odirect=true` or
+  `use_uring_cmd=true`, an aligned memory object backed by a contiguous CPU
+  tensor can expose its physical allocation for a padded transfer. The view is bounded
+  by both the tensor span and the object's physical size; allocation rounding
+  alone does not guarantee that the tensor spans that allocation. A full-length view
+  avoids capacity-induced full-buffer copies in regular io_uring and
+  io_uring_cmd and enables direct POSIX reads. POSIX padded writes retain their
+  tail bounce. Objects that cannot expose enough aligned capacity retain the
+  engine-specific staging or bounce path. Writes zero the exposed padding in
+  place without changing the logical payload; callers must keep the allocation
+  valid until I/O completes.
 
 ## Relationship to Non-MP Mode
 

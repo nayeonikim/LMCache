@@ -136,6 +136,52 @@ def make_memory_obj(payload: bytes | bytearray | memoryview) -> TensorMemoryObj:
     return TensorMemoryObj(raw_data, metadata, parent_allocator=None)
 
 
+def make_aligned_memory_obj(
+    payload: bytes | bytearray | memoryview,
+    *,
+    align: int = RAW_BLOCK_CI_BLOCK_ALIGN,
+    tail_fill: int = 0xA5,
+    span_bytes: int | None = None,
+    physical_size: int | None = None,
+) -> TensorMemoryObj:
+    """Wrap payload bytes the way the MP L1 allocator lays them out.
+
+    The object starts at an ``align``-aligned address and its ``raw_data``
+    spans the payload rounded up to ``align``, while ``byte_array`` exposes
+    only the payload. The allocation tail after the payload is pre-filled
+    with ``tail_fill`` so tests can see whether I/O touched it.
+
+    Args:
+        payload: Logical object contents.
+        align: Address and allocation alignment in bytes.
+        tail_fill: Byte value written into the allocation tail after the payload.
+        span_bytes: Length of ``raw_data``; defaults to the payload rounded up
+            to ``align``.
+        physical_size: Metadata ``phy_size``; defaults to ``span_bytes``.
+
+    Returns:
+        Tensor memory object whose logical size is ``len(payload)``.
+    """
+    data = bytes(payload)
+    if span_bytes is None:
+        span_bytes = (len(data) + align - 1) // align * align
+    if physical_size is None:
+        physical_size = span_bytes
+    backing = torch.full((span_bytes + align,), tail_fill, dtype=torch.uint8)
+    offset = (-backing.data_ptr()) % align
+    raw_data = backing[offset : offset + span_bytes]
+    raw_data[: len(data)] = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+    metadata = MemoryObjMetadata(
+        shape=torch.Size([len(data)]),
+        dtype=torch.uint8,
+        address=0,
+        phy_size=physical_size,
+        fmt=MemoryFormat.BINARY,
+        ref_count=1,
+    )
+    return TensorMemoryObj(raw_data, metadata, parent_allocator=None)
+
+
 def make_empty_memory_obj(size_bytes: int) -> TensorMemoryObj:
     """Create a zero-filled binary tensor memory object.
 
