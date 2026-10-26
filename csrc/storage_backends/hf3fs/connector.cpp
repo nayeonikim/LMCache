@@ -538,6 +538,12 @@ void Hf3fsConnector::do_single_set(WorkerHf3fsConn& conn,
 /**
  * Check if a key exists.
  *
+ * With the key buffer enabled, a buffered key is answered without a 3FS
+ * metadata call. A key missing from the buffer is still checked on 3FS,
+ * because other LMCache instances sharing the base paths may have stored
+ * it after this connector's startup scan; a key found this way is added to
+ * the buffer.
+ *
  * @param conn Connection to use
  * @param key Key to check
  * @return true if key exists, false otherwise
@@ -545,11 +551,15 @@ void Hf3fsConnector::do_single_set(WorkerHf3fsConn& conn,
 bool Hf3fsConnector::do_single_exists(WorkerHf3fsConn& conn,
                                       const std::string& key) {
   (void)conn;  // Unused
-  if (!buffer_enabled_) {
-    std::string file_path = key_to_path(key);
-    return std::filesystem::exists(file_path);
+  if (buffer_enabled_ && buffer_contains_(key)) {
+    return true;
   }
-  return buffer_contains_(key);
+  std::string file_path = key_to_path(key);
+  bool found = std::filesystem::exists(file_path);
+  if (found && buffer_enabled_) {
+    buffer_add_(key);
+  }
+  return found;
 }
 
 /**
@@ -671,7 +681,8 @@ void Hf3fsConnector::buffer_scan_worker_(
  * Add a key to the buffer.
  *
  * Thread-safe via concurrent_flat_hash_set (sharded locks).
- * Called after a successful do_single_set().
+ * Called after a successful do_single_set() or when do_single_exists()
+ * finds a key on 3FS that is missing from the buffer.
  */
 void Hf3fsConnector::buffer_add_(const std::string& key) {
   key_buffer_.Insert(key);
@@ -698,27 +709,6 @@ void Hf3fsConnector::buffer_remove_(const std::string& key) {
  */
 bool Hf3fsConnector::buffer_contains_(const std::string& key) const {
   return key_buffer_.Contains(key);
-}
-
-/**
- * Optimized batch exists using the in-memory key buffer.
- *
- * When the buffer is enabled, all lookups are answered from the hash
- * set in microseconds. When disabled, falls back to the base class
- * default which iterates do_single_exists (filesystem).
- */
-void Hf3fsConnector::do_batch_exists(WorkerHf3fsConn& conn,
-                                     const Request& req) {
-  (void)conn;
-  if (!buffer_enabled_) {
-    ConnectorBase::do_batch_exists(conn, req);
-    return;
-  }
-  // Buffer path: check cache for all keys
-  for (size_t i = 0; i < req.keys.size(); ++i) {
-    req.batch->per_key_results[req.start_idx + i] =
-        buffer_contains_(req.keys[i]) ? 1 : 0;
-  }
 }
 
 /**

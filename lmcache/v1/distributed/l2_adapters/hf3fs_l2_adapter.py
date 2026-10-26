@@ -57,8 +57,8 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
     - numa_id: NUMA node ID (default -1 = current node).
     - iov_size: Per-thread I/O buffer in bytes (default 200MB, range [100MB, 2GB]).
     - enable_key_buffer (bool): Enable in-memory key buffer for accelerated
-        exists lookups. When enabled, do_batch_exists() uses a pre-scanned
-        hash set instead of filesystem calls. Default: True.
+        exists lookups. When enabled, buffered keys skip filesystem calls and
+        other keys are still checked on 3FS. Default: True.
     - per_op_workers: Optional dict mapping lane keys
                 (``"lookup"``, ``"retrieve"``, ``"store"``,
                 ``"delete"``) to dedicated worker counts.  Ops

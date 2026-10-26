@@ -88,9 +88,9 @@ The **BUILD_HF3FS** environment variable controls compilation:
 - ``iov_size`` (int, default ``209715200`` (200 MB), range
   ``[104857600, 2147483648]``): Per-thread I/O buffer in bytes.
 - ``enable_key_buffer`` (bool, default ``True``): Enable the in-memory
-  key buffer for accelerated exists lookups.  When enabled, exist lookups
-  respond from a hash set instead of issuing remote 3FS metadata calls.
-  This dramatically reduces lookup latency.
+  key buffer for accelerated exists lookups.  When enabled, lookups of
+  buffered keys respond from a hash set instead of issuing remote 3FS
+  metadata calls; other keys are still checked on 3FS.
 
 **Configuration Example**
 
@@ -116,13 +116,19 @@ The **BUILD_HF3FS** environment variable controls compilation:
 
 **In-Memory Key Buffer**
 
-When ``enable_key_buffer`` is ``True`` (the default), the connector maintains an
-in-memory cache of all key filenames. Lookup operations respond from the cache instead
-of issuing remote 3FS metadata calls. This dramatically reduces lookup latency.
+When ``enable_key_buffer`` is ``True`` (the default), the connector keeps an
+in-memory set of the keys found by its startup scan and the keys it has stored or
+found since. A lookup of a key in the set responds without a remote 3FS metadata
+call. A lookup of any other key checks 3FS, so keys stored by other LMCache
+instances sharing the same base paths are still found.
+
+A key deleted by another instance stays in the set until this instance restarts,
+so a lookup can report it as present and the load of that key then fails.
 
 - **Trade-offs**
-   - **Enable** for workloads with many concurrent lookups (prefetch,batch exists). 
-  The latency savings outweigh the memory cost.
+   - **Enable** for workloads with many concurrent lookups of stored keys
+     (prefetch, batch exists). Lookups of keys not in the set cost the same 3FS
+     metadata call as with the buffer disabled.
    - **Disable**  when memory is constrained.
 
 To disable the buffer cache:

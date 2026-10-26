@@ -946,6 +946,94 @@ class TestHf3fsNativeConnector:
         assert bytes(buf) == data
         new_client.close()
 
+    def test_key_buffer_finds_key_stored_by_another_client(
+        self, hf3fs_native_client: tuple["LMCacheHf3fsClient", str, str]
+    ) -> None:
+        """A key stored by another client after startup is reported as existing.
+
+        Clients on different nodes share the same 3FS directory, so a key
+        missing from this client's buffer must still be found on 3FS.
+        """
+        # First Party
+        from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+        client, mount_point, base_paths = hf3fs_native_client
+        own_key = _object_key_to_string(create_object_key(500))
+        remote_key = _object_key_to_string(create_object_key(501))
+        absent_key = _object_key_to_string(create_object_key(502))
+        own_data = bytes(create_memory_obj(512, fill_value=1.0).byte_array)
+        remote_data = bytes(create_memory_obj(512, fill_value=2.0).byte_array)
+        client.submit_batch_set([own_key], [memoryview(own_data)])
+        assert _wait_for_completions(client)[0][1]
+
+        other_client = LMCacheHf3fsClient(
+            mount_point=mount_point,
+            base_paths=base_paths,
+            num_workers=2,
+            ior_entries=128,
+            io_depth=0,
+            numa_id=-1,
+            iov_size=209715200,
+            time_out=200,
+            enable_key_buffer=True,
+        )
+        try:
+            other_client.submit_batch_set([remote_key], [memoryview(remote_data)])
+            assert _wait_for_completions(other_client)[0][1]
+        finally:
+            other_client.close()
+
+        client.submit_batch_exists([own_key, remote_key, absent_key])
+        assert _wait_for_completions(client)[0][3] == [True, True, False]
+
+        buf = bytearray(len(remote_data))
+        client.submit_batch_get([remote_key], [memoryview(buf)])
+        assert _wait_for_completions(client)[0][3] == [True]
+        assert bytes(buf) == remote_data
+
+    def test_key_buffer_keeps_key_deleted_by_another_client(
+        self, hf3fs_native_client: tuple["LMCacheHf3fsClient", str, str]
+    ) -> None:
+        """A key in the buffer is reported as existing without checking 3FS.
+
+        A key found on 3FS is added to the buffer, so it stays present after
+        another client deletes it, and loading it then fails.
+        """
+        # First Party
+        from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+        client, mount_point, base_paths = hf3fs_native_client
+        key = _object_key_to_string(create_object_key(510))
+        data = bytes(create_memory_obj(512).byte_array)
+        other_client = LMCacheHf3fsClient(
+            mount_point=mount_point,
+            base_paths=base_paths,
+            num_workers=2,
+            ior_entries=128,
+            io_depth=0,
+            numa_id=-1,
+            iov_size=209715200,
+            time_out=200,
+            enable_key_buffer=True,
+        )
+        try:
+            other_client.submit_batch_set([key], [memoryview(data)])
+            assert _wait_for_completions(other_client)[0][1]
+            client.submit_batch_exists([key])
+            assert _wait_for_completions(client)[0][3] == [True]
+
+            other_client.submit_batch_delete([key])
+            assert _wait_for_completions(other_client)[0][1]
+        finally:
+            other_client.close()
+
+        client.submit_batch_exists([key])
+        assert _wait_for_completions(client)[0][3] == [True]
+
+        buf = bytearray(len(data))
+        client.submit_batch_get([key], [memoryview(buf)])
+        assert _wait_for_completions(client)[0][3] == [False]
+
     def test_key_buffer_scan_multipath_no_missing(self):
         """Regression: scan_and_build_buffer_ must scan every base_path even
         when there are more base_paths than worker threads.
